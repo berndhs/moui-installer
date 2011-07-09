@@ -1,0 +1,1109 @@
+#!/bin/bash
+
+# Configuration variables
+INSTALL_DIR=/tmp/sysimage
+LOGFILE=/tmp/install.log
+ROOTMNT=$INSTALL_DIR/di
+PART_BACKUP=	#backup partition table for rollback
+PART_PREFIX=
+HOMEID=
+ROOTID=
+
+VERSION=""
+IMAGE_TYPE=""
+USER_ANSWER=1
+SILENT_MODE=
+HAS_FACTORYPART=0
+FACTORYPART=
+BOOTDEV=""
+ROOTDEV=""
+SWAPDEV=""
+DEV=""
+DEV_SIZE=
+SMALLEST_SPACE=3000	#in MB
+
+# For partitioning, specially for install in free space
+WHOLE_DISK=
+declare -a DISK_ARRAY	#without /dev/ prefix, such as sda, sdb and etc.
+declare -a DISK_MENU
+declare -a PART_TABLE
+
+# For OS probe
+NEED_OS_PROBE=0
+OS_PROBE_ROOT_MOUNT=/tmp/os_probe_root
+OS_PROBE_BOOT_MOUNT=/tmp/os_probe_boot
+declare -a OTHER_PART_ARRAY
+declare -a ROOT_ARRAY
+declare -a BOOT_ARRAY
+declare -a KERNEL_ARRAY
+declare -a INITRD_ARRAY
+
+# File systems
+FORMATBOOT="mke2fs -t ext3"
+FORMATROOT="mkfs.btrfs"
+FORMATSWAP="mkswap"
+
+# Acts just like echo cmd, with automatic redirection
+dbglg () {
+	echo "+ `date +%T` $@" >> $LOGFILE
+}
+
+dbglg_exec () {
+	echo "+ `date +%T` $@" >> $LOGFILE
+	eval $@ >> $LOGFILE 2>&1
+}
+
+output () {
+	echo -e "¤ $@"
+	dbglg $@
+}
+
+fail_exit () {
+	output "\033[31m$@\033[0m Please check $LOGFILE for more details."
+	clean_env
+	exit 1
+}
+
+pre_partition () {
+	partprobe /dev/$DEV >> $LOGFILE 2>&1 && sleep 1
+}
+
+post_partition () {
+	if [ $? -ne 0 ]; then
+		fail_exit "Partitioning failed."
+	fi
+	sleep 1 && partprobe /dev/$DEV >> $LOGFILE 2>&1
+}
+
+persistent_umount () {
+	local MAX_TRY=10
+	local i=0
+	while mount |grep "$1 " > /dev/null 2>&1; do
+		if [ $i -ge $MAX_TRY ]; then
+			break
+		fi
+		dbglg_exec "umount $1"
+		i=$(($i+1))
+		sleep $i
+	done
+	if [ $i -ge $MAX_TRY ]; then
+		fail_exit "Umount $1 failed."
+	fi
+}
+
+# returns OK if $1 contains $2
+strstr() {
+  [ "${1#*$2*}" = "$1" ] && return 1
+  return 0
+}
+
+umount_and_rm () {
+	local MOUNT_POINT=$1
+	if [ -d $MOUNT_POINT ]; then
+		persistent_umount $MOUNT_POINT
+		dbglg_exec "rm -rf $MOUNT_POINT"
+	fi
+}
+
+clean_env () {
+	dbglg "clean env"
+	if [ -f $PART_BACKUP ]; then
+		dbglg_exec "rm -rf $PART_BACKUP"
+	fi
+	umount_and_rm $OS_PROBE_ROOT_MOUNT
+	umount_and_rm $OS_PROBE_BOOT_MOUNT
+	umount_and_rm $INSTALL_DIR/bootfs
+	umount_and_rm $ROOTMNT/home
+	umount_and_rm $ROOTMNT
+	dbglg_exec "rm -rf $INSTALL_DIR"
+}
+
+run_fsck () {
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		if [ -x $(which fsck) ]; then
+			persistent_umount $BOOTDEV
+			dbglg_exec "fsck -y $BOOTDEV"
+		fi
+	fi
+}
+
+wait_user () {
+	local first_char answer NUM PROMPT TMP_PROMPT
+	NUM=9
+	PROMPT=${1:-"The progress will start. Do you want to continue? "}
+	while true; do
+		while [ "$NUM" -ge 0 ]; do
+			TMP_PROMPT="$PROMPT $NUM (yes/no)[yes]"
+			echo -ne "\r$TMP_PROMPT"
+			unset first_char && read -t 1 -n 1 first_char
+			if [ -n "$first_char" ]; then
+				break
+			fi
+			NUM=$(($NUM-1))
+		done
+		if [ -z "$first_char" ]; then
+			USER_ANSWER=1
+			break
+		fi
+		unset answer && read answer
+		answer=`printf "%s%s" "$first_char" "$answer"`
+		if [ "$answer" = "yes" ]; then
+			USER_ANSWER=1
+			break
+		elif [ "$answer" = "no" ]; then
+			USER_ANSWER=0
+			break
+		fi
+	done
+	echo ""
+}
+
+check_and_choose_disk () {
+	output "Check all disks and choose one to install"
+	local SIZE VENDOR MODEL DISKNAME LIVE_DEV INDEX i
+# Get available disks
+	LIVE_DEV=""
+	INDEX=0
+	LIVE_DEV=`cat /etc/mtab | grep " /mnt/live " | cut -d " " -f1 | sed "s/[0-9]//"`
+	for i in `cat /proc/partitions | sed -n "s/\ *[0-9][0-9]*\ *[0-9][0-9]*\ *[0-9][0-9]*\ \(\([a-z]*\)\|mmcblk[0-9]\)$/\1/p"`; do
+		if test "/dev/$i" = "$LIVE_DEV" ; then
+			dbglg "$i looks to be the live device, skip"
+			continue
+		fi
+		SIZE=`sfdisk -s /dev/$i | sed 's/\([0-9]*\)[0-9]\{3\}/\1/'`
+		if [ -n $SIZE -a $SIZE -ge $SMALLEST_SPACE ]; then
+			VENDOR=`[ -f /sys/block/$i/device/vendor ] && cat /sys/block/$i/device/vendor`
+			MODEL=`[ -f /sys/block/$i/device/model ] && cat /sys/block/$i/device/model`
+			DISK_MENU[$INDEX]=$(printf "%s %s %s %s" "/dev/$i" "$VENDOR" "$MODEL" "${SIZE}MB")
+			DISK_ARRAY[$INDEX]=$i
+			INDEX=$(($INDEX+1))
+		fi
+	done
+	if [ ${#DISK_ARRAY[*]} -eq 0 ]; then
+		fail_exit "No disk large enough, at leat ${SMALLEST_SPACE}MB, to install MeeGo."
+	fi
+	dbglg "Find disks: ${DISK_ARRAY[@]}, NOTE: Disks doesn't be listed here if its capacity size is smaller than ${SMALLEST_SPACE}MB"
+	dbglg "Got disk_list: ${DISK_MENU[@]}"
+}
+
+choose_device () {
+# Select a disk to install MeeGo
+	local OLD_PS3
+	OLD_PS3=$PS3
+	PS3="Please select one disk to install MeeGo:"
+	select tmp_dev in "${DISK_MENU[@]}" "CANCEL"; do
+		if [ $REPLY -eq $((1+${#DISK_ARRAY[@]})) ]; then
+			fail_exit "Canceled."
+		elif [ $REPLY -lt 1 -o $REPLY -gt ${#DISK_ARRAY[*]} ]; then
+			echo "$PS3"
+			continue
+		fi
+		DEV=${DISK_ARRAY[$(($REPLY-1))]}
+		DEV_SIZE=$(($(sfdisk -s /dev/$DEV)/1024))	
+		if [ ! -b /dev/$DEV ]; then
+			output "/dev/$DEV is not a block device, please choose another one"
+			continue
+		fi
+		break
+	done
+	PS3=$OLD_PS3
+	unset tmp_dev
+	output "Select disk /dev/$DEV ${DEV_SIZE}MB for install"
+}
+
+whole_disk () {
+	local OLD_PS3
+# Whether use the whole disk or not
+	OLD_PS3=$PS3
+	PS3="Please Choose:"
+	select tmp_whole_disk in "Install MeeGo In Free Space On /dev/$DEV" \
+		"Remove All Partitions On /dev/$DEV And Install MeeGo" "Cancel"; do
+		if [ $REPLY -eq 3 ]; then
+			fail_exit "Canceled."
+		elif [ $REPLY -lt 1 -o $REPLY -gt 2 ]; then
+			echo "$PS3"
+			continue
+		fi
+		WHOLE_DISK=$(($REPLY-1))
+		break
+	done
+	unset tmp_whole_disk
+}
+
+rollback () {
+	local ANSWER
+	echo -n "This is the last chance to rollback, Are you sure you want to continue?(y/n)[y]"
+	read ANSWER
+	ANSWER=$(echo $ANSWER |tr 'A-Z' 'a-z')
+	if [ "x$ANSWER" = "x" -o "x$ANSWER" = "xy" ]; then
+		output "Make partition table permanently"
+	else
+		output "Rollback disk partition table, please wait..."
+		pre_partition
+		sfdisk /dev/$DEV >/dev/null 2>&1 < $PART_BACKUP
+		post_partition
+		fail_exit "Rollback partition finished."
+	fi	
+}
+
+check_partition () {
+	local FACTORYPART_START FACTORYPART_SIZE
+	if [[ "$DEV" == mmcblk[0-9] ]]; then
+		PART_PREFIX=p;
+	fi
+	FACTORYPART=/dev/${DEV}${PART_PREFIX}2
+	if [ -e $FACTORYPART ]; then
+		dbglg "Check factorypart: $FACTORYPART"
+		FACTORYPART_START=$(sfdisk -l -uM /dev/$DEV |grep "^$FACTORYPART" |awk '{printf "%d", $2}')
+		FACTORYPART_SIZE=$(sfdisk -l -uM /dev/$DEV |grep "^$FACTORYPART" |awk '{printf "%d", $4}')
+		dbglg "factorypart_start: $FACTORYPART_START MB factorypart_size: $FACTORYPART_SIZE MB"
+		if [ $FACTORYPART_START -lt 10 -a $FACTORYPART_SIZE -le 50 ]; then
+#got reserved partition, delete other partitions
+			HAS_FACTORYPART=1
+			for tmp_num in $(fdisk -l /dev/$DEV |grep "^/dev/" |awk '{print $1}' |rev |cut -c1);
+			do
+				if [ $tmp_num -eq 2 ]; then
+					continue
+				else
+					dbglg "Remove partition /dev/${DEV}${PART_PREFIX}${tmp_num}"
+					pre_partition
+					fdisk /dev/$DEV >/dev/null 2>&1 <<-EOF
+					d
+					$tmp_num
+					w
+					EOF
+					post_partition
+				fi
+			done
+			sleep 1
+		fi
+	fi
+}
+
+create_partitions () {
+	local DISK_USED DISK_FREE HOLE_START HOLE_END HOLE_MAX INDEX i
+	local HAS_EXTENDED EXTENDED_START EXTENDED_END EXTENDED_NR
+	local BOOT_SIZE SWAP_SIZE ROOT_SIZE
+	local LOGICAL_CUR_MAX LOGICAL_BOOT
+	if [ $SILENT_MODE -eq 0 ]; then
+		whole_disk
+	elif [ $SILENT_MODE -eq 1 ]; then
+		WHOLE_DISK=1
+	else
+		fail_exit "Never should be here."
+	fi
+# Umount device firstly if it mounted.
+	for i in $(mount |grep "$DEV" |awk '{print $1}'); do
+		output "Umount $i, please wait..."
+		persistent_umount $i
+	done
+# Backup partition table before partitioning
+	PART_BACKUP="/tmp/sfdisk.$DEV.backup.$$"
+	sfdisk -d /dev/$DEV > $PART_BACKUP
+	BOOT_SIZE=200
+	SWAP_SIZE=256
+# Use whole disk
+	if [ $WHOLE_DISK -eq 1 ]; then
+		output "Install meego in whole disk"
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			ROOT_SIZE=$((DEV_SIZE - SWAP_SIZE - BOOT_SIZE))
+			dbglg "got dev_size=${DEV_SIZE}MB boot_size=${BOOT_SIZE}MB swap_size=${SWAP_SIZE}MB root_size=${ROOT_SIZE}MB"
+		elif [ $IMAGE_TYPE = "nandfs" ]; then
+			SWAP_SIZE=32
+			ROOT_SIZE=$(($DEV_SIZE-$SWAP_SIZE))
+			dbglg "got dev_size=${DEV_SIZE}MB swap_size=${SWAP_SIZE}MB root_size=${ROOT_SIZE}MB"
+		fi
+		output "Create default partition layout, please wait..."
+		pre_partition
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			sfdisk -uM /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+			,$BOOT_SIZE,L,*
+			,$ROOT_SIZE,L
+			,,S
+			EOF
+		elif [ $IMAGE_TYPE = "nandfs" ]; then
+			check_partition
+			if [ $HAS_FACTORYPART -eq 0 ]; then
+				sfdisk -uM /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+				,$ROOT_SIZE,L,*
+				,,S
+				EOF
+			elif [ $HAS_FACTORYPART -eq 1 ]; then
+				output "Reserve $FACTORYPART"
+				FACTORYPART_END_CYL=$(sfdisk -l /dev/$DEV |grep "^$FACTORYPART" |awk '{printf "%d", $3}')
+				CYL_TOTAL=$(fdisk -l /dev/$DEV 2>/dev/null |grep "heads,.*sectors/track,.*cylinders" |awk '{print $5}')
+				CYL_SIZE=$(fdisk -l /dev/$DEV 2>/dev/null |grep "^Units" |awk '{printf "%d", $9}')
+				SWAP_SIZE_CYL=$(($SWAP_SIZE*1024*1024/$CYL_SIZE))
+				ROOT_SIZE_CYL=$(($CYL_TOTAL-$SWAP_SIZE_CYL-$FACTORYPART_END_CYL-2))
+				ROOT_SIZE=$(($ROOT_SIZE_CYL*$CYL_SIZE/1024/1024))
+				dbglg "cylinders:$CYL_TOTAL, cylinder size:$CYL_SIZE, factorypart_cyl_end: $FACTORYPART_END_CYCLE"
+				dbglg "root_start_cyl=$(($FACTORYPART_END_CYL+1)), root_size_cyl:$ROOT_SIZE_CYL, root_size: $ROOT_SIZE"
+				dbglg "swap_start_cyl=$(($FACTORYPART_END_CYL+$ROOT_SIZE_CYL+1)), swap_size_cyl:$SWAP_SIZE_CYL, swap_size:$SWAP_SIZE"
+				dbglg "sfdisk /dev/$DEV -N1"
+				sfdisk /dev/$DEV -N1 >> $LOGFILE 2>&1 <<-EOF
+				$(($FACTORYPART_END_CYL+1)),$ROOT_SIZE_CYL,L,*
+				y
+				EOF
+				dbglg "sfdisk /dev/$DEV -N3"
+				sfdisk /dev/$DEV -N3 >> $LOGFILE 2>&1 <<-EOF
+				$(($FACTORYPART_END_CYL+$ROOT_SIZE_CYL+1)),$SWAP_SIZE_CYL,S
+				y
+				EOF
+			fi
+		fi
+		post_partition
+# Use free space, it's a little complicated
+	elif [ $WHOLE_DISK -eq 0 ]; then
+		output "Install meego in free space"
+# Has an extended partition or not, if so, we just lookup free space in extended partition
+		if sfdisk -l /dev/$DEV |grep "Extended" >/dev/null 2>&1; then
+			HAS_EXTENDED=1
+			EXTENDED_START=$(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep "Extended" |awk '{printf "%d", $2}')
+			EXTENDED_END=$(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep "Extended" |awk '{printf "%d", $3}')
+			PART_TABLE[0]=$EXTENDED_START
+		else
+			if ! sfdisk -l /dev/$DEV |grep "^/dev/" |grep "Empty" > /dev/null 2>&1; then
+				fail_exit "Can't create extended partition, there are already 4 primary partitions."
+			fi
+			HAS_EXTENDED=0
+			PART_TABLE[0]=0
+		fi
+# Whether free space large enough or not
+		DISK_USED=$(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep -v "Extended" |grep -v "Empty" |awk 'BEGIN{sum=0}{sum+=$((NF-3))}END{print sum}')
+		DISK_FREE=$(($DEV_SIZE-$DISK_USED))
+		if [ $DISK_FREE -lt $SMALLEST_SPACE ]; then
+			fail_exit "Free space is too small, at least need ${SMALLEST_SPACE}MB, there is only ${DISK_FREE}MB left."
+		fi
+# Get partition table
+		INDEX=1		
+		for i in $(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep -v "Extended" |grep -v "Empty" |
+			awk '{if(NF<=8){printf "%d,%d\n", $((NF-5)),$((NF-4))}else{printf "%d,%d\n", $((NF-8)),$((NF-7))}}' |sort -n); do
+			tmp_s=$(echo $i |cut -d',' -f1)
+			tmp_e=$(echo $i |cut -d',' -f2)
+# Has no extended partition
+			if [ $HAS_EXTENDED -eq 0 ]; then
+				PART_TABLE[$INDEX]=$tmp_s
+				PART_TABLE[$(($INDEX+1))]=$tmp_e
+				INDEX=$(($INDEX+2))
+# Has extended partition
+			elif [ $HAS_EXTENDED -eq 1 ]; then
+				if [ $tmp_s -ge $EXTENDED_START -a $tmp_e -le $EXTENDED_END ]; then
+					PART_TABLE[$INDEX]=$tmp_s
+					PART_TABLE[$(($INDEX+1))]=$tmp_e
+					INDEX=$(($INDEX+2))
+				fi
+			else
+				fail_exit "Never should be here."
+			fi
+		done
+		unset tmp_s tmp_e
+		if [ $HAS_EXTENDED -eq 0 ]; then
+			PART_TABLE[$INDEX]=$DEV_SIZE
+		elif [ $HAS_EXTENDED -eq 1 ]; then
+			PART_TABLE[$INDEX]=$EXTENDED_END
+		else
+			fail_exit "Never should be here."
+		fi
+		dbglg "partition table: ${PART_TABLE[@]}"
+# Find the max free space hole
+		INDEX=1
+		HOLE_MAX=0
+		while [ $INDEX -lt ${#PART_TABLE[*]} ]; do
+			tmp_hole=$((${PART_TABLE[$(($INDEX))]}-${PART_TABLE[$(($INDEX-1))]}))
+			if [ $tmp_hole -gt $HOLE_MAX ]; then
+				HOLE_MAX=$tmp_hole
+				HOLE_START=${PART_TABLE[$(($INDEX-1))]}
+				HOLE_END=${PART_TABLE[$INDEX]}
+			fi
+			INDEX=$(($INDEX+2))
+		done
+		unset tmp_hole
+		output "Find free space ${HOLE_MAX}MB at [$HOLE_START,$HOLE_END]MB"
+# Free space is large enough?
+		if [ $HOLE_MAX -lt $SMALLEST_SPACE ]; then
+			fail_exit "Can't find suitable free space, at least ${SMALLEST_SPACE}MB, please partitioning yourself."
+		fi
+		LOGICAL_BOOT=5
+		output "Create default partition layout, please wait..."
+# If has no extended partition, creat one
+		if [ $HAS_EXTENDED -eq 0 ]; then
+			EXTENDED_NR=$(sfdisk -l /dev/$DEV |grep "^/dev/" |grep "Empty" |head -1 |awk '{print $1}' |rev |cut -c1)
+			if [ -z $EXTENDED_NR ]; then
+				fail_exit "Never should be here."
+			fi
+			pre_partition
+			sfdisk -uM /dev/$DEV -N$EXTENDED_NR >> $LOGFILE 2>&1 <<-EOF
+			$(($HOLE_START+1)),$(($HOLE_MAX-10)),E,
+			y
+			EOF
+			post_partition
+# If has extended partition
+		elif [ $HAS_EXTENDED -eq 1 ]; then
+			LOGICAL_CUR_MAX=$(sfdisk -l /dev/$DEV |grep "^/dev/" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]" |sort -nr |head -1)
+			if [ $LOGICAL_CUR_MAX -ge $LOGICAL_BOOT ]; then
+				LOGICAL_BOOT=$(($LOGICAL_CUR_MAX+1))
+			fi
+		else
+			fail_exit "Never should be here"
+		fi
+# If there is a swap partition, just use it
+		tmp_swap_nr=$(sfdisk -l /dev/$DEV |grep "^/dev/.*Linux swap / Solaris$" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]" |head -1)
+		ROOT_SIZE=$(($HOLE_MAX-$BOOT_SIZE-$SWAP_SIZE))
+		pre_partition
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			if [ -z $tmp_swap_nr ]; then
+				fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+				n
+				l
+
+				+${BOOT_SIZE}M
+				n
+				l
+
+				+${ROOT_SIZE}M
+				n
+				l
+
+
+				w
+				EOF
+			else
+				output "Find swap partition on this disk, just use it"
+				fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+				n
+				l
+
+				+${BOOT_SIZE}M
+				n
+				l
+
+
+				w
+				EOF
+			fi
+		elif [ $IMAGE_TYPE = "nandfs" ]; then
+			if [ -z $tmp_swap_nr ]; then
+				fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+				n
+				l
+
+				+${ROOT_SIZE}M
+				n
+				l
+
+
+				w
+				EOF
+			else
+				output "Find swap partition on this disk, just use it"
+				fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+				n
+				l
+
+
+				w
+				EOF
+			fi
+		fi
+		post_partition
+	else
+		fail_exit "Never should be here."
+	fi
+# Special case for mmc-devices, add a p before the partition number
+	if [[ "$DEV" == mmcblk[0-9] ]]; then
+		PART_PREFIX=p;
+	fi
+	if [ $WHOLE_DISK -eq 1 ]; then
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			BOOTDEV=/dev/${DEV}${PART_PREFIX}1
+			ROOTDEV=/dev/${DEV}${PART_PREFIX}2
+			SWAPDEV=/dev/${DEV}${PART_PREFIX}3
+		elif [ $IMAGE_TYPE = "nandfs" ]; then
+			ROOTDEV=/dev/${DEV}${PART_PREFIX}1
+			if [ $HAS_FACTORYPART -eq 0 ]; then
+				SWAPDEV=/dev/${DEV}${PART_PREFIX}2
+			elif [ $HAS_FACTORYPART -eq 1 ]; then
+				SWAPDEV=/dev/${DEV}${PART_PREFIX}3
+			fi
+		fi
+	elif [ $WHOLE_DISK -eq 0 ]; then
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			BOOTDEV=/dev/${DEV}${PART_PREFIX}$LOGICAL_BOOT
+		fi
+# toggle the old boot partition doesn't bootable
+		pre_partition
+		old_bootdev=$(sfdisk -l /dev/$DEV 2>/dev/null |grep "^/dev/" |grep "\*" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]")
+		if [ -n $old_bootdev ]; then
+			sfdisk -N$old_bootdev /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+			,,,-
+			EOF
+			post_partition
+		fi
+		unset old_bootdev
+# toggle the new boot partition bootable
+		pre_partition
+		sfdisk -N$LOGICAL_BOOT /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
+		,,,*
+		EOF
+		post_partition
+		if [ $IMAGE_TYPE = "liveimg" ]; then
+			ROOTDEV=/dev/${DEV}${PART_PREFIX}$(($LOGICAL_BOOT+1))
+		elif [ $IMAGE_TYPE = "nandfs" ]; then
+			ROOTDEV=/dev/${DEV}${PART_PREFIX}$LOGICAL_BOOT
+		fi
+		if [ -z $tmp_swap_nr ]; then
+			if [ $IMAGE_TYPE = "liveimg" ]; then
+				SWAPDEV=/dev/${DEV}${PART_PREFIX}$(($LOGICAL_BOOT+2))
+			elif [ $IMAGE_TYPE = "nandfs" ]; then
+				SWAPDEV=/dev/${DEV}${PART_PREFIX}$(($LOGICAL_BOOT+1))
+			fi
+			pre_partition
+			if [ $IMAGE_TYPE = "liveimg" ]; then
+				sfdisk -c /dev/$DEV $(($LOGICAL_BOOT+2)) 82
+			elif [ $IMAGE_TYPE = "nandfs" ]; then
+				sfdisk -c /dev/$DEV $(($LOGICAL_BOOT+1)) 82
+			fi
+			post_partition
+		else
+			SWAPDEV=/dev/${DEV}${PART_PREFIX}$tmp_swap_nr
+		fi
+	else
+		fail_exit "Never should be here."
+	fi
+	unset tmp_swap_nr
+	output "Partitioning finished"
+# the last chance to roll back
+	output "====================new partition table======================"
+	if [ $HAS_FACTORYPART -eq 0 ]; then
+		sfdisk -l -uM /dev/$DEV |tee -a $LOGFILE
+	else
+		sfdisk -l /dev/$DEV |tee -a $LOGFILE
+	fi
+	output "============The following partitions will be used============"
+	tmp_awk_str="%-15s%-15s%-15s%-10s\n"
+	echo -e "Device\tMount Point\tFilesystem\tSize(MB)" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		echo -e "${BOOTDEV}\t/boot\text3\t${BOOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+	fi	
+	echo -e "${ROOTDEV}\t/\tbtrfs\t${ROOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+	echo -e "${SWAPDEV}\t\tswap\t${SWAP_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+	unset tmp_awk_str
+	if [ $SILENT_MODE -eq 0 ]; then
+		rollback
+	fi
+}
+
+create_fs () {
+	output "Create filesystems"
+# If device is not null
+	pre_partition
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		if [ -n $BOOTDEV ]; then
+			persistent_umount $BOOTDEV
+			output "Creating filesystem on $BOOTDEV: ext3"
+			dbglg_exec "$FORMATBOOT $BOOTDEV"
+		elif [ $IMAGE_TYPE != "nandfs" ]; then	
+			fail_exit "No boot device."
+		fi
+	fi
+	if [ -n $ROOTDEV ]; then
+		persistent_umount $ROOTDEV
+		output "Creating filesystem on $ROOTDEV: btrfs"
+#workaround for the issue of creating btrfs
+		if cat /proc/mounts | grep "^/dev/root" >/dev/null 2>&1 && [ ! -e /dev/root ]; then
+			HAS_BTRFSWORKAROUND="yes"
+			dbglg_exec "touch /dev/root"
+		fi
+		dbglg_exec "$FORMATROOT $ROOTDEV"
+		if [ ! -z $HAS_BTRFSWORKAROUND ]; then
+			dbglg_exec "rm -rf /dev/root"
+		fi
+	else
+		fail_exit "No root device"
+	fi
+	if [ -n $SWAPDEV ]; then
+		persistent_umount $SWAPDEV
+		output "Creating filesystem on $SWAPDEV: swap"
+		dbglg_exec "$FORMATSWAP $SWAPDEV"
+	else
+		fail_exit "No swap device."
+	fi
+# Make root and home subvol's
+	dbglg_exec "mount $ROOTDEV $ROOTMNT -o subvolid=0"
+	dbglg_exec "btrfs subvol create $ROOTMNT/meego_root"
+	dbglg_exec "btrfs subvol create $ROOTMNT/meego_home"
+	ROOTID=$(btrfs subvol list $ROOTMNT | awk ' ($7 == "meego_root") { print $2 }')
+	HOMEID=$(btrfs subvol list $ROOTMNT | awk ' ($7 == "meego_home") { print $2 }')
+	dbglg_exec "btrfs subvol set-default $ROOTID $ROOTMNT"
+	persistent_umount $ROOTMNT
+# Create /home with proper permissions inside meego_root
+	[ ! -d $ROOTMNT ] && mkdir -p $ROOTMNT
+	dbglg_exec "mount $ROOTDEV $ROOTMNT"
+	dbglg_exec "chmod 0755 $ROOTMNT"
+	dbglg_exec "mkdir $ROOTMNT/home"
+	dbglg_exec "chmod 0755 $ROOTMNT/home"
+	persistent_umount $ROOTMNT
+}
+
+progress_bar () {
+	local FINISH TOTAl PRO_BAR NUM PER_CENT
+	FINISH=$1
+	TOTAL=$2
+	PER_CENT=$3
+	NUM=0
+	PRO_BAR="   ["
+	while [ $NUM -lt $TOTAL ]; do
+		NUM=$((NUM + 1))
+		if [ $NUM -le $FINISH ]; then
+			PRO_BAR="${PRO_BAR}="
+		else
+			PRO_BAR="${PRO_BAR} "
+		fi
+	done
+	if [ $PER_CENT -lt 10 ]; then
+		PRO_BAR="${PRO_BAR}]   ${PER_CENT}%"
+	else
+		PRO_BAR="${PRO_BAR}]  ${PER_CENT}%"
+	fi
+	echo -ne "\r$PRO_BAR"
+}
+
+check_status () {
+	local FS TOTAL_SIZE CUR_SIZE PER_CENT
+	FS=$1
+	TOTAL_SIZE=$2
+	progress_bar 0 25 0
+	while true; do
+		sleep 5
+		CUR_SIZE=`df $FS | grep "$FS" | tr -s ' ' ' ' | cut -d' ' -f3`
+		PER_CENT=$((CUR_SIZE*100/TOTAL_SIZE))
+		NUM=$((PER_CENT/4))
+		if [ $PER_CENT -eq 100 ]; then
+			dbglg "Copy programme finished? Also check with rsync process"
+		fi
+		CP_STATUS=`ps ax | grep  "rsync -aq.*$ROOTMNT" | grep -v grep | wc -l`
+		dbglg "$FS $TOTAL_SIZE $CUR_SIZE $PER_CENT $NUM $CP_STATUS"
+		if [ $CP_STATUS -lt 1 ]; then
+			dbglg "Copy programme finished, set progress bar to 100%"
+			progress_bar 25 25 100
+			break
+		fi
+#the filesystem size calculation of compressed btrfs is not so accurate here
+		if [ $PER_CENT -gt 100 ]; then
+			PER_CENT=100
+		fi
+		progress_bar $NUM 25 $PER_CENT
+	done
+}
+
+mount_check () {
+	eval "$@" >> $LOGFILE 2>&1
+	if [ $? -ne 0 ]; then
+		fail_exit "Failed to mount."
+	fi
+}
+
+copy_fs () {
+
+	dbglg "Set timezone before copying: /usr/sbin/hwclock --hctosys -u"
+	/usr/sbin/hwclock --hctosys -u >> $LOGFILE 2>&1
+	output "Mount partitions"
+# Attempt to mount the prepared partition using the given partition fs type
+	dbglg "mount -t btrfs -o relatime,compress $ROOTDEV $ROOTMNT"
+	mount_check "mount -t btrfs -o relatime,compress $ROOTDEV $ROOTMNT"
+	dbglg "mount -t btrfs -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
+	mount_check "mount -t btrfs -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		dbglg "mount -t ext3 $BOOTDEV $INSTALL_DIR/bootfs"
+		mount_check "mount -t ext3 $BOOTDEV $INSTALL_DIR/bootfs"
+	fi
+# Copy OS
+	output "Copy root file system"
+	TOTAL_SIZE=`df /| grep /| tr -s ' ' ' ' | cut -d' ' -f3`
+	dbglg "Read root fs size = $TOTAL_SIZE"
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		dbglg_exec "rsync -aq --exclude=/boot/* --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/media/* --exclude=/tmp/* / $ROOTMNT &"
+	elif [ $IMAGE_TYPE = "nandfs" ]; then
+		dbglg_exec "rsync -aq --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/media/* --exclude=/tmp/* / $ROOTMNT &"
+	fi
+	check_status $ROOTMNT $TOTAL_SIZE
+	echo ""
+# Create minimal devices
+	dbglg_exec "mkdir -m 0755 $ROOTMNT/dev/pts"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/null c 1 3"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/urandom c 1 9"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/random c 1 8"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/full c 1 7"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/ptmx c 5 2"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/zero c 1 5"
+	dbglg_exec "mknod -m 0755 $ROOTMNT/dev/console c 5 1ls"
+	dbglg_exec "mknod -m 0755 $ROOTMNT/dev/fb0 c 29 0"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/tty c 4 0"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/tty1 c 4 1"
+	dbglg_exec "mknod -m 0666 $ROOTMNT/dev/tty2 c 4 2"
+	dbglg_exec "ln -s /proc/self/fd $ROOTMNT/dev/fd"
+	dbglg_exec "ln -s /proc/self/fd/0 $ROOTMNT/dev/stdin"
+	dbglg_exec "ln -s /proc/self/fd/1 $ROOTMNT/dev/stdout"
+	dbglg_exec "ln -s /proc/self/fd/2 $ROOTMNT/dev/stderr"
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		output "Copy boot file system"
+		progress_bar 0 25 0
+		dbglg_exec "rsync -aq /boot/ $INSTALL_DIR/bootfs"
+		progress_bar 25 25 100
+		echo ""
+	fi
+	output "Syncing filesystem, please wait..."
+	dbglg_exec "sync"
+}
+
+write_fstab () {
+	local FSTAB_FILE
+	FSTAB_FILE=${ROOTMNT}/etc/fstab
+	output "Write fstab and mtab"
+	echo "# Created by installer-shell" > $FSTAB_FILE
+	if [ $IMAGE_TYPE = "liveimg" ]; then
+		echo "$BOOTDEV    /boot   ext3    defaults                                    1 2" >> $FSTAB_FILE
+	fi
+	echo "$ROOTDEV    /       btrfs   nodatasum,relatime,compress                 1 1" >> $FSTAB_FILE
+	echo "$ROOTDEV    /home   btrfs   nodatasum,relatime,compress,subvolid=$HOMEID    1 2" >> $FSTAB_FILE
+	echo "$SWAPDEV    swap    swap    defaults                                    0 0" >> $FSTAB_FILE
+
+	cat >> $FSTAB_FILE <<EOF
+tmpfs                   /dev/shm                tmpfs   defaults        0 0
+devpts                  /dev/pts                devpts  gid=5,mode=620  0 0
+sysfs                   /sys                    sysfs   defaults        0 0
+proc                    /proc                   proc    defaults        0 0
+EOF
+
+	dbglg_exec "rm -rf $ROOTMNT/etc/mtab"
+	dbglg "write /etc/adjtime"
+	if [ ! -f ${ROOTMNT}/etc/adjtime ]; then
+		echo "0.0 0 0.0" > ${ROOTMNT}/etc/adjtime
+		echo "0" >> ${ROOTMNT}/etc/adjtime
+	fi
+	echo "UTC" >> ${ROOTMNT}/etc/adjtime
+	cat ${ROOTMNT}/etc/adjtime >> $LOGFILE 2>&1
+}
+
+os_probe () {
+	local ROOT_PART FSTAB OS_PREFIX INDEX i j
+	output "Probe other installed operating systems"
+# Find other partitions that maybe a root(/) partition
+	INDEX=0
+	for i in $(sfdisk -l /dev/$DEV |grep "^/dev/" |grep -v "Extended" |grep -v "Empty" |grep -v "Linux swap / Solaris" |awk '{print $1}' |
+		grep -o "[1-9]\|[1-9][0-9]"); do
+		if [ "/dev/${DEV}${PART_PREFIX}$i" != "$ROOTDEV" -a "/dev/${DEV}${PART_PREFIX}$i" != "$BOOTDEV" ]; then
+			OTHER_PART_ARRAY[$INDEX]="/dev/${DEV}${PART_PREFIX}$i"
+			INDEX=$(($INDEX+1))
+		fi
+	done
+	dbglg "OTHER_PART_ARRAY=${OTHER_PART_ARRAY[@]}"
+# Find other /boot partitions
+	if [ ${#OTHER_PART_ARRAY[*]} -eq 0 ]; then
+		output "No other operating system"
+		return 1
+	fi
+	FSTAB="$OS_PROBE_ROOT_MOUNT/etc/fstab"
+	INDEX=0
+	for ROOT_PART in ${OTHER_PART_ARRAY[@]}; do
+		if ! mount $ROOT_PART $OS_PROBE_ROOT_MOUNT >> $LOGFILE 2>&1 ; then
+			dbglg "mount $ROOT_PART $OS_PROBE_ROOT_MOUNT FAILED"
+			continue
+		fi
+# Maybe non-linux system
+		if [ ! -f $FSTAB ]; then
+			dbglg "$ROOT_PART is not an linux / partition"
+			persistent_umount $OS_PROBE_ROOT_MOUNT
+			continue
+		fi
+# Store in array
+		ROOT_ARRAY[$INDEX]=$ROOT_PART
+# Find the corresponding /boot partition
+		tmp_boot=$(cat $FSTAB |grep -v "^\s*#" |grep "/boot" |awk '{print $1}')
+# No seperately /boot partition
+		if [ -z $tmp_boot ]; then
+			BOOT_ARRAY[$INDEX]=$ROOT_PART
+			INDEX=$(($INDEX+1))
+			persistent_umount $OS_PROBE_ROOT_MOUNT
+			continue
+		elif echo "$tmp_boot" |grep "UUID=" > /dev/null 2>&1; then
+			tmp_boot_uuid=${tmp_boot#*UUID=}
+			tmp_boot="/dev/$(ls -l /dev/disk/by-uuid |grep $tmp_boot_uuid |rev |cut -d'/' -f1 |rev)"
+		fi
+		BOOT_ARRAY[$INDEX]=$tmp_boot
+		INDEX=$(($INDEX+1))
+		persistent_umount $OS_PROBE_ROOT_MOUNT
+		unset tmp_boot tmp_boot_uuid
+	done
+	dbglg "find / partitions: ${ROOT_ARRAY[@]}"
+	dbglg "find /boot partitions: ${BOOT_ARRAY[@]}"
+# Find kernel/initrd in /boot partitions
+	INDEX=0
+	for i in ${BOOT_ARRAY[@]}; do
+		if ! mount $i $OS_PROBE_BOOT_MOUNT >> $LOGFILE 2>&1; then
+			output "Mount $ROOT_PART $OS_PROBE_BOOT_MOUNT FAILED"
+			INDEX=$(($INDEX+1))
+			continue
+		fi
+		if [ -d $OS_PROBE_BOOT_MOUNT/boot ]; then
+			tmp_dir="$OS_PROBE_BOOT_MOUNT/boot"
+			OS_PREFIX="/boot"
+		else
+			tmp_dir="$OS_PROBE_BOOT_MOUNT"
+			OS_PREFIX=""
+		fi
+		for j in $(find $tmp_dir -type f -name "vmlinu[z|x]*"); do
+			tmp_ker="${j#*$tmp_dir/}"
+			tmp_ver=$(echo "$tmp_ker" |cut -d'-' -f2-)
+			tmp_ker="${OS_PREFIX}/$tmp_ker"
+			tmp_ker_str=$(printf "%s,%s" $tmp_ker $tmp_ker_str)
+			if [ -f $tmp_dir/initrd.img-$tmp_ver ]; then
+				tmp_initrd="${OS_PREFIX}/initrd.img-$tmp_ver"
+				tmp_initrd_str=$(printf "%s,%s" $tmp_initrd $tmp_initrd_str)
+			else
+				tmp_initrd_str=$(printf "%s,%s" "no-initrd" $tmp_initrd_str)
+			fi
+			unset tmp_ker tmp_ver tmp_ker_str tmp_initrd tmp_initrd_str
+		done
+		KERNEL_ARRAY[$INDEX]="$tmp_ker_str"
+		INITRD_ARRAY[$INDEX]="$tmp_initrd_str"
+		output "Find kernels: $tmp_ker_str in $i"
+		output "Find initrds: $tmp_initrd_str in $i"
+		INDEX=$(($INDEX+1))
+		persistent_umount $OS_PROBE_BOOT_MOUNT
+		unset tmp_dir
+	done
+	return 0
+}
+
+update_extlinux () {
+	local LABEL="label Linux"
+	local KERNEL INITRD APPEND INDEX ROOT_PART index
+	declare -a tmp_ker_array
+	declare -a tmp_initrd_array
+	INDEX=0
+	for ROOT_PART in ${ROOT_ARRAY[@]}; do
+		APPEND="${ROOT_PART} quiet vga=current"
+# Get kernel array for an OS
+		tmp_ker_str=${KERNEL_ARRAY[$INDEX]}
+		index=0
+		for tmp_ker in ${tmp_ker_str//,/ }; do
+			tmp_ker_array[$index]=$tmp_ker
+			index=$(($index+1))
+		done
+# Get initrd array for an OS
+		tmp_initrd_str=${INITRD_ARRAY[$INDEX]}
+		index=0
+		for tmp_initrd in ${tmp_initrd_str//,/ }; do
+			tmp_initrd_array[$index]=$tmp_initrd
+			index=$(($index+1))
+		done
+# Get extlinux menu
+		index=0
+		for tmp_ker in ${tmp_ker_array[@]}; do
+			MENU="menu label Linux (${tmp_ker##*/})"
+			KERNEL="kernel $tmp_ker"
+			echo "$LABEL" >> $1
+			echo "        $MENU"	>> $1
+			echo "        $KERNEL" >> $1
+			if [ "no-initrd" != "${tmp_initrd_array[$index]}" ]; then
+				INITRD="initrd ${tmp_initrd_array[$index]}"
+				echo "        $INITRD" >> $1
+			fi
+			echo "        append ro root=$APPEND" >> $1
+			index=$(($index+1))
+		done
+		INDEX=$((INDEX+1))
+		unset tmp_ker tmp_initrd tmp_ker_str tmp_initrd_str
+	done
+	unset tmp_ker_array tmp_initrd_array
+}
+
+install_syslinux () {
+	local CONF_FILE=$INSTALL_DIR/bootfs/extlinux/extlinux.conf
+	local CONF_DIR=$INSTALL_DIR/bootfs/extlinux
+	local BOOTFS_DIR=$INSTALL_DIR/bootfs
+	local KERN LABEL i
+	output "Install bootloader"
+	if [ ! -x /sbin/extlinux ]; then
+		fail_exit "Syslinux-extlinux package is not installed."
+	fi
+# Install extlinux
+	output "Install extlinux to /boot/extlinux"
+	dbglg_exec "/sbin/extlinux -i $CONF_DIR"
+	output "Write MBR to /dev/$DEV"
+	dbglg_exec "/bin/dd if=/dev/$DEV of=${CONF_DIR}/mbr.bak count=1 bs=512"
+	dbglg_exec "/bin/dd if=${ROOTMNT}/usr/share/syslinux/mbr.bin of=/dev/$DEV"
+# Generate extlinux.conf
+	output "Write extlinux.conf"
+	echo "# extlinux.conf - generated by installer-shell" > $CONF_FILE
+	echo "" >> $CONF_FILE
+	echo "prompt 0" >> $CONF_FILE
+	echo "timeout 1" >> $CONF_FILE
+	for i in ivi connext automotive; do
+		IVI=`find $BOOTFS_DIR -name config-*-$i`
+		if [ -z $IVI ]; then
+			continue
+		else
+			break;
+		fi
+	done
+	dbglg "Is this IVI build? $IVI"
+	if [ -z $IVI ]; then
+		echo "default vesamenu.c32" >> $CONF_FILE
+	else
+		echo "default menu.c32" >> $CONF_FILE
+	fi
+	cat >> $CONF_FILE <<EOF
+
+menu autoboot Starting MeeGo...
+menu hidden
+menu background splash.jpg
+menu title Welcome to MeeGo!
+menu color border      0 #ffffffff #00000000
+menu color sel         7 #ffffffff #ff000000
+menu color title       0 #ffffffff #00000000
+menu color tabmsg      0 #ffffffff #00000000
+menu color unsel       0 #ffffffff #00000000
+menu color hotsel      0 #ff000000 #ffffffff
+menu color hotkey      7 #ffffffff #ff000000
+menu color timeout_msg 0 #ffffffff #00000000
+menu color timeout     0 #ffffffff #00000000
+menu color cmdline     0 #ffffffff #00000000
+
+EOF
+	KERN=`find $BOOTFS_DIR -name vmlinuz-* -printf %f`
+	LABEL=${KERN/vmlinuz-/}
+	dbglg "Read kern=$KERN label=$LABEL"
+	echo "label meego" >> $CONF_FILE
+	echo "        menu label MeeGo ($LABEL)" >> $CONF_FILE
+	echo "        kernel $KERN" >> $CONF_FILE
+	echo "        append ro root=$ROOTDEV quiet vga=current" >> $CONF_FILE
+	echo "        menu default" >> $CONF_FILE
+# update extlinux menu
+	if [ $WHOLE_DISK -eq 0 -a -n $NEED_OS_PROBE -a $NEED_OS_PROBE -eq 1 ]; then
+		if os_probe; then
+			update_extlinux $CONF_FILE
+		fi
+	fi
+	output "Copy background picture"
+	dbglg_exec "cp ${ROOTMNT}/usr/lib/anaconda-runtime/syslinux-vesa-splash.jpg ${CONF_DIR}/splash.jpg"
+	dbglg_exec "ln -s ../${KERN} ${CONF_DIR}/${KERN}"
+}
+
+create_factory_snapshot ()
+{
+	# create a quick snapshot of meego_root -> meego_root_factory
+	sync
+	persistent_umount $ROOTMNT/home
+	persistent_umount $ROOTMNT
+	dbglg_exec "mount -o subvolid=0 $ROOTDEV $ROOTMNT"
+	dbglg_exec "btrfs subvol snapshot $ROOTMNT/meego_root $ROOTMNT/meego_root_factory"
+	persistent_umount $ROOTMNT
+}
+
+rebuild_initrd () {
+	output "Rebuild initrd with new fstab"
+	chroot ${ROOTMNT} /bin/sh <<-'END'
+	for KVER in $(ls /lib/modules); do
+		INITRD="/boot/initrd-${KVER}.img"
+		if [ -w $INITRD ]; then
+			mkinitrd -f $INITRD $KVER >/dev/null
+		fi
+	done
+        if [ -w /boot/kboot.cmdline ]; then
+		sed -i "s/ 4 */ /" /boot/kboot.cmdline
+        fi
+	END
+}
+
+do_postinstall () {
+	local POST_SCRIPT="/etc/installer/post_install.sh"
+	output "Run post install scripts"
+	if [ ! -f $POST_SCRIPT ]; then
+		dbglg "The post script $POST_SCRIPT doesn't exist, return"
+		return
+	fi
+	dbglg_exec "cp $POST_SCRIPT ${ROOTMNT}$POST_SCRIPT"
+	dbglg_exec "mount -t proc proc $ROOTMNT/proc"
+	dbglg_exec "mount -t devpts devpts $ROOTMNT/dev/pts"
+	dbglg_exec "mount -t sysfs sysfs $ROOTMNT/sys"
+	dbglg_exec "chroot $ROOTMNT $POST_SCRIPT"
+	persistent_umount $ROOTMNT/sys
+	persistent_umount $ROOTMNT/dev/pts
+	persistent_umount $ROOTMNT/proc
+}
+
+VERSION=`head -1 /etc/meego-release`
+trap "clean_env" INT TERM
+echo > $LOGFILE
+output "Welcome to MeeGo $VERSION"
+# should not be present in install mode, but in case of ...
+dbglg_exec "killall -9 automountd >/dev/null 2>&1"
+
+# Clean environent before start
+clean_env
+output "Start install"
+
+# Create directory for the install partition to be mounted
+mkdir -p $ROOTMNT
+mkdir -p $INSTALL_DIR/bootfs
+mkdir -p $OS_PROBE_ROOT_MOUNT
+mkdir -p $OS_PROBE_BOOT_MOUNT
+
+check_and_choose_disk
+wait_user "\033[31mDestroy all your data on $(echo ${DISK_MENU[0]} |tr -s ' ' ' ') and install?\033[0m"
+if [ $USER_ANSWER -eq 0 ]; then
+	SILENT_MODE=0
+	choose_device
+	output ""
+	output "\033[31mWARNING:\033[0m"
+	output ""
+	output "You are going to install MeeGo. For this /dev/$DEV will be formated"
+	output "which will cause all existing data on this disk to be lost."
+	output ""
+elif [ $USER_ANSWER -eq 1 ]; then
+	SILENT_MODE=1
+	if [ ! -b /dev/${DISK_ARRAY[0]} ]; then
+		fail_exit "/dev/${DISK_ARRAY[0]} is not a block device."
+	fi
+	DEV=${DISK_ARRAY[0]}
+	DEV_SIZE=$(($(sfdisk -s /dev/$DEV)/1024))	
+else
+	fail_exit "Never should be here."
+fi
+#check the image type
+cmdline=$(cat /proc/cmdline)
+if strstr "$cmdline" liveimg || [ -e /dev/live-osimg ]; then
+	IMAGE_TYPE="liveimg"
+else
+	IMAGE_TYPE="nandfs"
+fi
+create_partitions
+create_fs
+copy_fs
+write_fstab
+if [ "$IMAGE_TYPE" = "liveimg" ]; then
+	install_syslinux
+else
+	rebuild_initrd
+fi
+do_postinstall
+
+output "Copy log file"
+dbglg_exec "cp $LOGFILE $ROOTMNT$LOGFILE"
+
+create_factory_snapshot
+
+clean_env
+
+run_fsck
+
+# finish and reboot
+output ""
+output "Installation is complete."
+output ""
+output "You can shutdown the device, unplug the removable disk and boot"
+output "to the installed system."
+output ""
+exit 0

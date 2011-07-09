@@ -1,0 +1,30 @@
+Name: instalateur
+Summary: A shell-script based installer
+Version: 0.1.0
+Release: 1
+Group: Applications/System
+License: GPLv2+
+URL: http://moui.sourceforge.net
+Sources:
+    - instalateur-%{version}.tar.gz
+Patches:
+Description: |
+    A shell-script based installer which implements the installation process in silent mode
+Requires:
+    - parted
+    - dialog
+    - rsync
+    - system-logos
+    - e2fsprogs
+    - btrfs-progs
+    - util-linux-ng
+    - syslinux-extlinux
+    - instalateur-launch
+Configure: none
+Builder: none
+NoDesktop: True
+SubPackages:
+    - Name: instalateur-launch
+      Summary: A script to launch instalateur
+      Group: Applications/System
+      Description: Liveinst script to launch instalateur
