@@ -18,7 +18,6 @@ Requires:
     - btrfs-progs
     - util-linux-ng
     - syslinux-extlinux
-    - instalateur-launch
 Configure: none
 Builder: make
 NoDesktop: True

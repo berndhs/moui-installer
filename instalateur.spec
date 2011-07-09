@@ -22,7 +22,6 @@ Requires:   e2fsprogs
 Requires:   btrfs-progs
 Requires:   util-linux-ng
 Requires:   syslinux-extlinux
-Requires:   instalateur-launch
 
 
 %description
