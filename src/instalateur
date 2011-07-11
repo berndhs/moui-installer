@@ -3,7 +3,7 @@
 # Configuration variables
 INSTALL_DIR=/tmp/sysimage
 LOGFILE=/tmp/install.log
-ROOTMNT=$INSTALL_DIR/di
+ROOTMNT=$INSTALL_DIR
 PART_BACKUP=  #backup partition table for rollback
 PART_PREFIX=
 HOMEID=
@@ -55,7 +55,7 @@ dbglg_exec () {
 }
 
 output () {
-  echo -e "ÃÂÃÂ¤ $@"
+  echo -e "==> $@"
   dbglg $@
 }
 
@@ -73,7 +73,7 @@ post_partition () {
   if [ $? -ne 0 ]; then
     fail_exit "Partitioning failed."
   fi
-  sleep 1 && partprobe /dev/$DEV >> $LOGFILE 2>&1
+  sleep 2 && partprobe /dev/$DEV >> $LOGFILE 2>&1
 }
 
 persistent_umount () {
@@ -301,13 +301,12 @@ check_partition () {
   fi
 }
 
-}}}}}
 use_existing_partition () {
-  local DISK_USED DISK_FREE HOLE_START HOLE_END HOLE_MAX INDEX i
+  local DISK_USED DISK_FREE HOLE_START HOLE_END HOLE_SIZE INDEX i
   local HAS_EXTENDED EXTENDED_START EXTENDED_END EXTENDED_NR
   local BOOT_SIZE SWAP_SIZE ROOT_SIZE
   local LOGICAL_CUR_MAX LOGICAL_BOOT
-  local PART LEN_PART
+  local PART LEN_PART FOUND
   WHOLE_DISK=0
 # Umount device firstly if it mounted.
   for i in $(mount |grep "$DEV" |awk '{print $1}'); do
@@ -331,17 +330,22 @@ use_existing_partition () {
     INDEX=$(($INDEX+2))
   done
 
+  sfdisk -l -uM /dev/$DEV
+
 # Use user selected partiton
   output "Install meego in partition"
-        echo -n " which partition [1] ?"
-        read PART
-        output " You chose partition " $PART
+  echo -n " which partition [1] ?"
+  read PART
+  output " You chose partition " $PART
   INDEX=1    
   LEN_PART=$(expr length $PART)
   if [ $LEN_PART -ne 1 ]; then
     fail_exit "bad partition number " $PART_NUM
   fi
-  INDEX=$PART_NUM
+  INDEX=1
+  ROW=1
+  HOLE_SIZE=0
+  FOUND=0
   for i in $(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep -v "Extended" |grep -v "Empty" |
     awk '{if(NF<=8){printf "%d,%d\n", $((NF-5)),$((NF-4))}else{printf "%d,%d\n", $((NF-8)),$((NF-7))}}' |sort -n); do
     tmp_s=$(echo $i |cut -d',' -f1)
@@ -350,55 +354,62 @@ use_existing_partition () {
     PART_TABLE[$INDEX]=$tmp_s
     PART_TABLE[$(($INDEX+1))]=$tmp_e
     INDEX=$(($INDEX+2))
+    HOLE_START=${tmp_s}
+    HOLE_END=${tmp_e}
+    HOLE_SIZE=$((${HOLE_END} - ${HOLE_START}))
+    output " Part " $ROW " start " $HOLE_START " end " $HOLE_END " size " $HOLE_SIZE
+    if [ $ROW -eq $PART ]; then
+      FOUND=1
+      break;
+    fi
+    ROW=$(($ROW+1))
   done
   unset tmp_s tmp_e
-  PART_TABLE[$INDEX]=$DEV_SIZE
-  dbglg "partition table: ${PART_TABLE[@]}"
 # Find the max free space hole
   INDEX=1
-  HOLE_MAX=0
-  while [ $INDEX -lt ${#PART_TABLE[*]} ]; do
-    tmp_hole=$((${PART_TABLE[$(($INDEX))]}-${PART_TABLE[$(($INDEX-1))]}))
-    if [ $tmp_hole -gt $HOLE_MAX ]; then
-      HOLE_MAX=$tmp_hole
-      HOLE_START=${PART_TABLE[$(($INDEX-1))]}
-      HOLE_END=${PART_TABLE[$INDEX]}
-    fi
-    INDEX=$(($INDEX+2))
-  done
-  unset tmp_hole
-  output "Find free space ${HOLE_MAX}MB at [$HOLE_START,$HOLE_END]MB"
-# Free sace is large enough?
-  if [ $HOLE_MAX -lt $SMALLEST_SPACE ]; then
+  output "Find " $FOUND " space ${HOLE_SIZE}MB at [$HOLE_START,$HOLE_END]MB"
+# Free space is large enough?
+  if [ $HOLE_SIZE -lt $SMALLEST_SPACE ]; then
     fail_exit "Can't find suitable free space, at least ${SMALLEST_SPACE}MB, please partitioning yourself."
   fi
   LOGICAL_BOOT=5
   output "Create default partition layout, please wait..."
 # If has no extended partition, creat one
   EXTENDED_NR=$(sfdisk -l /dev/$DEV |grep "^/dev/" |grep "Empty" |head -1 |awk '{print $1}' |rev |cut -c1)
+  output "extended " $EXTENDED_NR
   if [ -z $EXTENDED_NR ]; then
-    fail_exit "Never should be here."
+    EXTENDED_NR=$PART
+  else
+    if [ $EXTENDED_NR -ne $PART ]; then
+      fail_exit "Already have extended partition, cannot create another"
+    fi
   fi
+  output " Partition " $PART " size " $HOLE_SIZE 
+  output " will convert to extended " $EXTENDED_NR
+  output " on device /dev/"$DEV
+  output " partitioning stage 1"
   pre_partition
-  sfdisk -uM /dev/$DEV -N$EXTENDED_NR >> $LOGFILE 2>&1 <<-EOF
-    $(($HOLE_START+1)),$(($HOLE_MAX-10)),E,
-    y
-	EOF
+  sfdisk /dev/$DEV -N$EXTENDED_NR --force >> $LOGFILE 2>&1 <<EOF
+    ,,E,
+y
+EOF
   post_partition
+  output " partitioning stage 2"
 # If there is a swap partition, just use it
   tmp_swap_nr=$(sfdisk -l /dev/$DEV |grep "^/dev/.*Linux swap / Solaris$" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]" |head -1)
   ROOT_SIZE=$(($HOLE_MAX-$BOOT_SIZE-$SWAP_SIZE))
   pre_partition
   if [ $IMAGE_TYPE = "liveimg" ]; then
     if [ -z $tmp_swap_nr ]; then
+      output " partitioning stage 3"
       fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
       n
       l
-      +${BOOT_SIZE}M
+	+${BOOT_SIZE}M
       n
       l
 
-      +${ROOT_SIZE}M
+	+${ROOT_SIZE}M
       n
       l
 
@@ -406,39 +417,43 @@ use_existing_partition () {
       w
 	EOF
     else
+      output " partitioning stage 4"
       output "Find swap partition on this disk, just use it"
       fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
       n
-      l
+      
         +${BOOT_SIZE}M
       n
-      l
+      
 
       w
 	EOF
     fi
   elif [ $IMAGE_TYPE = "nandfs" ]; then
     if [ -z $tmp_swap_nr ]; then
-      fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
-      n
-      l
-        +${ROOT_SIZE}M
-      n
-      l
+      output " partitioning stage 5"
+      fdisk /dev/$DEV >> $LOGFILE 2>&1 <<EOF
+n
+l
++${ROOT_SIZE}M
+n
+l
 
-      w
-	EOF
+w
+EOF
     else
       output "Find swap partition on this disk, just use it"
-      fdisk /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
-      n
-      l
+      output " partitioning stage 6"
+      fdisk /dev/$DEV >> $LOGFILE 2>&1 <<EOF
+n
+l
 
-      w
-	EOF
+w
+EOF
     fi
   fi
   post_partition
+  output " partitioning stage 7"
 # Special case for mmc-devices, add a p before the partition number
   if [[ "$DEV" == mmcblk[0-9] ]]; then
     PART_PREFIX=p;
@@ -461,20 +476,27 @@ use_existing_partition () {
       BOOTDEV=/dev/${DEV}${PART_PREFIX}$LOGICAL_BOOT
     fi
 # toggle the old boot partition to not be bootable
-    pre_partition
     old_bootdev=$(sfdisk -l /dev/$DEV 2>/dev/null |grep "^/dev/" |grep "\*" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]")
     if [ -n $old_bootdev ]; then
-      sfdisk -N$old_bootdev /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
-      ,,,-
-	EOF
+      output " partitioning stage 8"
+      output " de-bootify " $old_bootdev " of /dev/"$DEV 
+      pre_partition
+      sfdisk -N$old_bootdev /dev/$DEV --force >> $LOGFILE 2>&1 <<EOF
+,,,-
+y
+EOF
       post_partition
+      output " partitioning stage 8.5"
     fi
     unset old_bootdev
 # toggle the new boot partition bootable
+    output " partitioning stage 9"
+    output " logical boot is now " $LOGICAL_BOOT
     pre_partition
-    sfdisk -N$LOGICAL_BOOT /dev/$DEV >> $LOGFILE 2>&1 <<-EOF
-    ,,,*
-	EOF
+    sfdisk -N$LOGICAL_BOOT /dev/$DEV --force >> $LOGFILE 2>&1 <<EOF
+,,,*
+y
+EOF
     post_partition
     if [ $IMAGE_TYPE = "liveimg" ]; then
       ROOTDEV=/dev/${DEV}${PART_PREFIX}$(($LOGICAL_BOOT+1))
@@ -498,7 +520,7 @@ use_existing_partition () {
       SWAPDEV=/dev/${DEV}${PART_PREFIX}$tmp_swap_nr
     fi
   else
-    fail_exit "Never should be here."
+    fail_exit "Never should be here. 2"
   fi
   unset tmp_swap_nr
   output "Partitioning finished"
@@ -536,7 +558,7 @@ create_partitions () {
   elif [ $SILENT_MODE -eq 1 ]; then
     WHOLE_DISK=1
   else
-    fail_exit "Never should be here."
+    fail_exit "Never should be here. 3"
   fi
 # Umount device firstly if it mounted.
   for i in $(mount |grep "$DEV" |awk '{print $1}'); do
@@ -639,7 +661,7 @@ create_partitions () {
           INDEX=$(($INDEX+2))
         fi
       else
-        fail_exit "Never should be here."
+        fail_exit "Never should be here. 4"
       fi
     done
     unset tmp_s tmp_e
@@ -648,7 +670,7 @@ create_partitions () {
     elif [ $HAS_EXTENDED -eq 1 ]; then
       PART_TABLE[$INDEX]=$EXTENDED_END
     else
-      fail_exit "Never should be here."
+      fail_exit "Never should be here. 5"
     fi
     dbglg "partition table: ${PART_TABLE[@]}"
 # Find the max free space hole
@@ -675,7 +697,7 @@ create_partitions () {
     if [ $HAS_EXTENDED -eq 0 ]; then
       EXTENDED_NR=$(sfdisk -l /dev/$DEV |grep "^/dev/" |grep "Empty" |head -1 |awk '{print $1}' |rev |cut -c1)
       if [ -z $EXTENDED_NR ]; then
-        fail_exit "Never should be here."
+        fail_exit "Never should be here. 6"
       fi
       pre_partition
       sfdisk -uM /dev/$DEV -N$EXTENDED_NR >> $LOGFILE 2>&1 <<-EOF
@@ -690,7 +712,7 @@ create_partitions () {
         LOGICAL_BOOT=$(($LOGICAL_CUR_MAX+1))
       fi
     else
-      fail_exit "Never should be here"
+      fail_exit "Never should be here. 7"
     fi
 # If there is a swap partition, just use it
     tmp_swap_nr=$(sfdisk -l /dev/$DEV |grep "^/dev/.*Linux swap / Solaris$" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]" |head -1)
@@ -753,7 +775,7 @@ create_partitions () {
     fi
     post_partition
   else
-    fail_exit "Never should be here."
+    fail_exit "Never should be here. 8"
   fi
 # Special case for mmc-devices, add a p before the partition number
   if [[ "$DEV" == mmcblk[0-9] ]]; then
@@ -814,7 +836,7 @@ create_partitions () {
       SWAPDEV=/dev/${DEV}${PART_PREFIX}$tmp_swap_nr
     fi
   else
-    fail_exit "Never should be here."
+    fail_exit "Never should be here. 9"
   fi
   unset tmp_swap_nr
   output "Partitioning finished"
@@ -883,11 +905,13 @@ create_fs () {
   dbglg_exec "btrfs subvol set-default $ROOTID $ROOTMNT"
   persistent_umount $ROOTMNT
 # Create /home with proper permissions inside meego_root
-  [ ! -d $ROOTMNT ] && mkdir -p $ROOTMNT
+  mkdir -p $ROOTMNT
   dbglg_exec "mount $ROOTDEV $ROOTMNT"
   dbglg_exec "chmod 0755 $ROOTMNT"
   dbglg_exec "mkdir $ROOTMNT/home"
   dbglg_exec "chmod 0755 $ROOTMNT/home"
+  dbglg_exec "mkdir $ROOTMNT/bootfs"
+  dbglg_exec "chmod 0755 $ROOTMNT/bootfs"
   persistent_umount $ROOTMNT
 }
 
@@ -1317,7 +1341,7 @@ elif [ $USER_ANSWER -eq 1 ]; then
   DEV=${DISK_ARRAY[0]}
   DEV_SIZE=$(($(sfdisk -s /dev/$DEV)/1024))  
 else
-  fail_exit "Never should be here."
+  fail_exit "Never should be here. 10"
 fi
 #check the image type
 cmdline=$(cat /proc/cmdline)
