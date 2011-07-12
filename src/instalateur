@@ -9,6 +9,12 @@ PART_PREFIX=
 HOMEID=
 ROOTID=
 
+SYSTEM_TYPE="MeeGo"
+SYSTEM_LABEL="meego"
+
+MAIN_FS_TYPE="ext3"
+BOOT_FS_TYPE="ext3"
+
 VERSION=""
 IMAGE_TYPE=""
 USER_ANSWER=1
@@ -40,8 +46,9 @@ declare -a KERNEL_ARRAY
 declare -a INITRD_ARRAY
 
 # File systems
-FORMATBOOT="mke2fs -t ext3"
-FORMATROOT="mkfs.btrfs"
+FORMATBOOT="mke2fs -t ${BOOT_FS_TYPE}"
+FORMATROOT="mkfs.${MAIN_FS_TYPE}"
+ROOT_FORMAT_OPT="-j"
 FORMATSWAP="mkswap"
 
 # Acts just like echo cmd, with automatic redirection
@@ -60,7 +67,7 @@ output () {
 }
 
 fail_exit () {
-  output "\033[31m$@\033[0m Please check $LOGFILE for more details."
+  output "\033[1;32m$@\033[0m Please check $LOGFILE for more details."
   clean_env
   exit 1
 }
@@ -79,6 +86,7 @@ post_partition () {
 persistent_umount () {
   local MAX_TRY=10
   local i=0
+  output "try to unmount " $1
   while mount |grep "$1 " > /dev/null 2>&1; do
     if [ $i -ge $MAX_TRY ]; then
       break
@@ -88,7 +96,7 @@ persistent_umount () {
     sleep $i
   done
   if [ $i -ge $MAX_TRY ]; then
-    fail_exit "Umount $1 failed."
+    fail_exit "Umount \"$1\" failed."
   fi
 }
 
@@ -122,8 +130,10 @@ clean_env () {
 run_fsck () {
   if [ $IMAGE_TYPE = "liveimg" ]; then
     if [ -x $(which fsck) ]; then
-      persistent_umount $BOOTDEV
-      dbglg_exec "fsck -y $BOOTDEV"
+      if [ X$PART_SPLIT == "Xdual" ]; then
+        persistent_umount $BOOTDEV
+        dbglg_exec "fsck -y $BOOTDEV"
+      fi
     fi
   fi
 }
@@ -181,17 +191,17 @@ check_and_choose_disk () {
     fi
   done
   if [ ${#DISK_ARRAY[*]} -eq 0 ]; then
-    fail_exit "No disk large enough, at leat ${SMALLEST_SPACE}MB, to install MeeGo."
+    fail_exit "No disk large enough, at leat ${SMALLEST_SPACE}MB, to install $SYSTEM_TYPE."
   fi
   dbglg "Find disks: ${DISK_ARRAY[@]}, NOTE: Disks doesn't be listed here if its capacity size is smaller than ${SMALLEST_SPACE}MB"
   dbglg "Got disk_list: ${DISK_MENU[@]}"
 }
 
 choose_device () {
-# Select a disk to install MeeGo
+# Select a disk to install $SYSTEM_TYPE
   local OLD_PS3
   OLD_PS3=$PS3
-  PS3="Please select one disk to install MeeGo:"
+  PS3="Please select one disk to install $SYSTEM_TYPE:"
   select tmp_dev in "${DISK_MENU[@]}" "CANCEL"; do
     if [ $REPLY -eq $((1+${#DISK_ARRAY[@]})) ]; then
       fail_exit "Canceled."
@@ -237,8 +247,8 @@ whole_disk () {
 # Whether use the whole disk or not
   OLD_PS3=$PS3
   PS3="Please Choose:"
-  select tmp_whole_disk in "Install MeeGo In Free Space On /dev/$DEV" \
-    "Remove All Partitions On /dev/$DEV And Install MeeGo" "Cancel"; do
+  select tmp_whole_disk in "Install $SYSTEM_TYPE In Free Space On /dev/$DEV" \
+    "Remove All Partitions On /dev/$DEV And Install $SYSTEM_TYPE" "Cancel"; do
     if [ $REPLY -eq 3 ]; then
       fail_exit "Canceled."
     elif [ $REPLY -lt 1 -o $REPLY -gt 2 ]; then
@@ -302,6 +312,151 @@ check_partition () {
 }
 
 use_existing_partition () {
+  local ROW OLD_PS3
+  OLD_PS3=$PS3
+  PS3="single or split partition? "
+  select ans in "single file system mounted on /" \
+         "dual file systems mounted on / and /boot/" \
+         "CANCEL"; do
+    if [ $REPLY -eq 1  ]; then
+      PART_SPLIT="single"
+      break
+    elif [ $REPLY -eq 2 ]; then
+      PART_SPLIT="dual"
+      break
+    elif [ $REPLY -eq 3 ]; then
+      PART_SPLIT="quit"
+      break
+    fi
+  done
+  PS3=$OLD_PS3
+# Special case for mmc-devices, add a p before the partition number
+  if [[ "$DEV" == mmcblk[0-9] ]]; then
+    PART_PREFIX="p"
+  else
+    PART_PREFIX=""
+  fi
+  if [ X$PART_SPLIT == "Xdual" ] ; then
+    use_existing_dual_partition
+  elif [ X$PART_SPLIT == "Xsingle" ]; then
+    use_existing_single_partition
+  else
+    fail_exit "User Cancelled"
+  fi
+}
+
+use_existing_single_partition () {
+
+# make sure partition has the right type
+  local PART PART_LINE PART_DEV PART_TYPE ROW
+  local PART_START PART_END PART_SIZE
+# Umount device if it is mounted
+  for i in $(mount |grep "$DEV" |awk '{print $1}'); do
+    output "Umount $i, please wait..."
+    persistent_umount $i
+  done
+# Backup partition table before partitioning
+  PART_BACKUP="/tmp/sfdisk.$DEV.backup.$$"
+  sfdisk -d /dev/$DEV > $PART_BACKUP
+
+  sfdisk -l -uM /dev/$DEV
+
+# Use user selected partiton
+  output "Install $SYSTEM_TYPE in single partition"
+  echo -n " which partition [1] ?"
+  read PART
+  output " You chose partition " $PART
+  INDEX=1    
+  LEN_PART=$(expr length $PART)
+  if [ $LEN_PART -ne 1 ]; then
+    fail_exit "bad partition number " $PART_NUM
+  fi
+  INDEX=1
+  ROW=1
+  FOUND=0
+  PART_SIZE=0
+  for PART_LINE in $(
+                   sudo sfdisk -l -uM /dev/sda | 
+                   grep '^/dev/' | 
+                   sed 's/\*/\ /' | 
+                   awk '{printf "%s,%d,%d,%s ", $1,$2,$3,$6}'
+                   )
+    do
+    output "looking at " $PART_LINE
+    PART_DEV=$(echo $PART_LINE | cut -d',' -f1)
+    PART_START=$(echo $PART_LINE | cut -d',' -f2)
+    PART_END=$(echo $PART_LINE | cut -d',' -f3)
+    PART_TYPE=$(echo $PART_LIEN | cut -d',' -f4)
+    if [ $ROW -eq $PART ]; then
+      PART_SIZE=$(($PART_END-$PART_START+1))
+      FOUND=1
+      break
+    fi
+    ROW=$(($ROW+1))
+  done
+
+# check if big enough
+  INDEX=1
+  output "Find " $FOUND " space ${PART_SIZE}MB at [$PART_START,$PART_END]MB"
+# Free space is large enough?
+  if [ $PART_SIZE -lt $SMALLEST_SPACE ]; then
+    fail_exit " Not enough space, at least ${SMALLEST_SPACE}MB, please partitioning yourself."
+  fi
+  SWAPDEV=$(sfdisk -l /dev/$DEV |
+                  grep "^/dev/.*Linux swap / Solaris$" |
+                  awk '{print $1}' |
+                  head -1
+                )
+  if [ X$SWAPDEV == "X" ]; then
+    fail_exit "No Swap partition found"
+  fi
+  if [ ! X$PART_TYPE == "X83" ]; then
+    change_partition_type $DEV $PART "83"
+  fi
+  ROOTDEV="/dev/${DEV}${PART_PREFIX}${PART}"
+}
+
+change_partition_type () {
+  local THE_DEV PART_NUM THE_TYPE
+  THE_DEV=$1
+  PART_NUM=$2
+  THE_TYPE=$3
+  fdisk /dev/$DEV >> $LOGFILE 2>&1 <<EOF
+t
+$PART_NUM
+$THE_TYPE
+w
+EOF
+
+# toggle the old boot partition to not be bootable
+  old_bootdev=$(sfdisk -l /dev/$DEV 2>/dev/null |grep "^/dev/" |grep "\*" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]")
+  if [ -n $old_bootdev ]; then
+    output " partitioning stage 20"
+    output " de-bootify " $old_bootdev " of /dev/"$DEV 
+    pre_partition
+    sfdisk -N$old_bootdev /dev/$DEV --force >> $LOGFILE 2>&1 <<EOF
+,,,-
+y
+EOF
+    post_partition
+    output " partitioning stage 21"
+  fi
+# toggle the new boot partition to be bootable
+  new_bootdev=$PART_NUM
+  output " partitioning stage 23"
+  output " bootify " $new_bootdev " of /dev/"$DEV 
+  pre_partition
+  sfdisk -N$new_bootdev /dev/$DEV --force >> $LOGFILE 2>&1 <<EOF
+,,,*
+y
+EOF
+  post_partition
+  output " partitioning stage 22"
+
+  fdisk -l /dev/$DEV
+}
+
+use_existing_dual_partition () {
   local DISK_USED DISK_FREE HOLE_START HOLE_END HOLE_SIZE INDEX i
   local HAS_EXTENDED EXTENDED_START EXTENDED_END EXTENDED_NR
   local BOOT_SIZE SWAP_SIZE ROOT_SIZE
@@ -333,7 +488,7 @@ use_existing_partition () {
   sfdisk -l -uM /dev/$DEV
 
 # Use user selected partiton
-  output "Install meego in partition"
+  output "Install $SYSTEM_TYPE in partition"
   echo -n " which partition [1] ?"
   read PART
   output " You chose partition " $PART
@@ -537,7 +692,7 @@ EOF
   if [ $IMAGE_TYPE = "liveimg" ]; then
     echo -e "${BOOTDEV}\t/boot\text3\t${BOOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   fi  
-  echo -e "${ROOTDEV}\t/\tbtrfs\t${ROOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+  echo -e "${ROOTDEV}\t/\t${MAIN_FS_TYPE}\t${ROOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   echo -e "${SWAPDEV}\t\tswap\t${SWAP_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   unset tmp_awk_str
   if [ $SILENT_MODE -eq 0 ]; then
@@ -572,7 +727,7 @@ create_partitions () {
   SWAP_SIZE=256
 # Use whole disk
   if [ $WHOLE_DISK -eq 1 ]; then
-    output "Install meego in whole disk"
+    output "Install $SYSTEM_TYPE in whole disk"
     if [ $IMAGE_TYPE = "liveimg" ]; then
       ROOT_SIZE=$((DEV_SIZE - SWAP_SIZE - BOOT_SIZE))
       dbglg "got dev_size=${DEV_SIZE}MB boot_size=${BOOT_SIZE}MB swap_size=${SWAP_SIZE}MB root_size=${ROOT_SIZE}MB"
@@ -622,7 +777,7 @@ create_partitions () {
     post_partition
 # Use free space, it's a little complicated
   elif [ $WHOLE_DISK -eq 0 ]; then
-    output "Install meego in free space"
+    output "Install $SYSTEM_TYPE in free space"
 # Has an extended partition or not, if so, we just lookup free space in extended partition
     if sfdisk -l /dev/$DEV |grep "Extended" >/dev/null 2>&1; then
       HAS_EXTENDED=1
@@ -853,7 +1008,7 @@ create_partitions () {
   if [ $IMAGE_TYPE = "liveimg" ]; then
     echo -e "${BOOTDEV}\t/boot\text3\t${BOOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   fi  
-  echo -e "${ROOTDEV}\t/\tbtrfs\t${ROOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
+  echo -e "${ROOTDEV}\t/\t${MAIN_FS_TYPE}\t${ROOT_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   echo -e "${SWAPDEV}\t\tswap\t${SWAP_SIZE}" |awk -F'\t' '{printf "'$tmp_awk_str'", $1,$2,$3,$4}' |tee -a $LOGFILE
   unset tmp_awk_str
   if [ $SILENT_MODE -eq 0 ]; then
@@ -862,33 +1017,47 @@ create_partitions () {
 }
 
 create_fs () {
-  output "Create filesystems"
+  local PART_ORG
+  PART_ORG=$1
+  output "Create " $PART_ORG " filesystems"
 # If device is not null
   pre_partition
+  output " See if we create boot device " $BOOTDEV
+  BOOT_DIR=$INSTALL_DIR/boot
   if [ $IMAGE_TYPE = "liveimg" ]; then
-    if [ -n $BOOTDEV ]; then
-      persistent_umount $BOOTDEV
-      output "Creating filesystem on $BOOTDEV: ext3"
-      dbglg_exec "$FORMATBOOT $BOOTDEV"
-    elif [ $IMAGE_TYPE != "nandfs" ]; then  
-      fail_exit "No boot device."
+    if [ X${PART_ORG} == "Xdual" ]; then
+      BOOT_DIR=$INSTALL_DIR/bootfs
+      if [ -n $BOOTDEV ]; then
+        persistent_umount $BOOTDEV
+        output "Creating filesystem on $BOOTDEV: ${BOOT_FS_TYPE}"
+        dbglg_exec "$FORMATBOOT $BOOTDEV"
+      elif [ $IMAGE_TYPE != "nandfs" ]; then  
+        fail_exit "No boot device."
+      fi
+    else
+      BOOT_DIR=$INSTALL_DIR/boot
     fi
   fi
+  output " See if we create root device " $ROOTDEV
   if [ -n $ROOTDEV ]; then
     persistent_umount $ROOTDEV
-    output "Creating filesystem on $ROOTDEV: btrfs"
-#workaround for the issue of creating btrfs
+    output "Creating filesystem on $ROOTDEV: ${MAIN_FS_TYPE}"
+#workaround for the issue of creating ${MAIN_FS_TYPE}
     if cat /proc/mounts | grep "^/dev/root" >/dev/null 2>&1 && [ ! -e /dev/root ]; then
       HAS_BTRFSWORKAROUND="yes"
       dbglg_exec "touch /dev/root"
     fi
-    dbglg_exec "$FORMATROOT $ROOTDEV"
-    if [ ! -z $HAS_BTRFSWORKAROUND ]; then
-      dbglg_exec "rm -rf /dev/root"
+    output "want to do: " "$FORMATROOT $ROOT_FORMAT_OPT $ROOTDEV"
+    dbglg_exec "$FORMATROOT $ROOT_FORMAT_OPT $ROOTDEV"
+    if [ X${MAIN_FS_TYPE} == "Xbtrfs" ]; then
+      if [ ! -z $HAS_BTRFSWORKAROUND ]; then
+        dbglg_exec "rm -rf /dev/root"
+      fi
     fi
   else
-    fail_exit "No root device"
+    fail_exit "No root device"  
   fi
+  output " See if we create swap device " $SWAPDEV
   if [ -n $SWAPDEV ]; then
     persistent_umount $SWAPDEV
     output "Creating filesystem on $SWAPDEV: swap"
@@ -897,21 +1066,34 @@ create_fs () {
     fail_exit "No swap device."
   fi
 # Make root and home subvol's
-  dbglg_exec "mount $ROOTDEV $ROOTMNT -o subvolid=0"
-  dbglg_exec "btrfs subvol create $ROOTMNT/meego_root"
-  dbglg_exec "btrfs subvol create $ROOTMNT/meego_home"
-  ROOTID=$(btrfs subvol list $ROOTMNT | awk ' ($7 == "meego_root") { print $2 }')
-  HOMEID=$(btrfs subvol list $ROOTMNT | awk ' ($7 == "meego_home") { print $2 }')
-  dbglg_exec "btrfs subvol set-default $ROOTID $ROOTMNT"
+  output " Main File system type is " ${MAIN_FS_TYPE}
+  if [ X${MAIN_FS_TYPE} == "Xbtrfs" ]; then
+    dbglg_exec "mount $ROOTDEV $ROOTMNT -o subvolid=0"
+    dbglg_exec "${MAIN_FS_TYPE} subvol create $ROOTMNT/${SYSTEM_LABEL}_root"
+    dbglg_exec "${MAIN_FS_TYPE} subvol create $ROOTMNT/${SYSTEM_LABEL}_home"
+    ROOTID=$(${MAIN_FS_TYPE} subvol list $ROOTMNT | awk ' ($7 == "${SYSTEM_LABEL}_root") { print $2 }')
+    HOMEID=$(${MAIN_FS_TYPE} subvol list $ROOTMNT | awk ' ($7 == "${SYSTEM_LABEL}_home") { print $2 }')
+    dbglg_exec "${MAIN_FS_TYPE} subvol set-default $ROOTID $ROOTMNT"
+  else
+    dbglg_exec "mount $ROOTDEV $ROOTMNT"
+    
+  fi
   persistent_umount $ROOTMNT
-# Create /home with proper permissions inside meego_root
+# Create /home with proper permissions inside ${SYSTEM_LABEL}_root
   mkdir -p $ROOTMNT
   dbglg_exec "mount $ROOTDEV $ROOTMNT"
   dbglg_exec "chmod 0755 $ROOTMNT"
   dbglg_exec "mkdir $ROOTMNT/home"
   dbglg_exec "chmod 0755 $ROOTMNT/home"
-  dbglg_exec "mkdir $ROOTMNT/bootfs"
-  dbglg_exec "chmod 0755 $ROOTMNT/bootfs"
+  if [ X$PART_SPLIT == "Xdual" ]; then
+    dbglg_exec "mkdir $ROOTMNT/bootfs"
+    dbglg_exec "chmod 0755 $ROOTMNT/bootfs"
+  else
+    dbglg_exec "mkdir $ROOTMNT/boot"
+    dbglg_exec "chmod 0755 $ROOTMNT/boot"
+    dbglg_exec "mkdir $ROOTMNT/boot/extlinux"
+    dbglg_exec "chmod 0755 $ROOTMNT/boot/extlinux"
+  fi
   persistent_umount $ROOTMNT
 }
 
@@ -958,7 +1140,7 @@ check_status () {
       progress_bar 25 25 100
       break
     fi
-#the filesystem size calculation of compressed btrfs is not so accurate here
+#the filesystem size calculation of compressed ${MAIN_FS_TYPE} is not so accurate here
     if [ $PER_CENT -gt 100 ]; then
       PER_CENT=100
     fi
@@ -975,17 +1157,26 @@ mount_check () {
 
 copy_fs () {
 
+  local BOOT_EXCLUDE
+
   dbglg "Set timezone before copying: /usr/sbin/hwclock --hctosys -u"
   /usr/sbin/hwclock --hctosys -u >> $LOGFILE 2>&1
   output "Mount partitions"
 # Attempt to mount the prepared partition using the given partition fs type
-  dbglg "mount -t btrfs -o relatime,compress $ROOTDEV $ROOTMNT"
-  mount_check "mount -t btrfs -o relatime,compress $ROOTDEV $ROOTMNT"
-  dbglg "mount -t btrfs -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
-  mount_check "mount -t btrfs -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
+  if [ X${MAIN_FS_TYPE} == "Xbtrfs" ]; then
+    dbglg "mount -t ${MAIN_FS_TYPE} -o relatime,compress $ROOTDEV $ROOTMNT"
+    mount_check "mount -t ${MAIN_FS_TYPE} -o relatime,compress $ROOTDEV $ROOTMNT"
+    dbglg "mount -t ${MAIN_FS_TYPE} -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
+    mount_check "mount -t ${MAIN_FS_TYPE} -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
+  else
+    dbglg "mount -t ${MAIN_FS_TYPE} $ROOTDEV $ROOTMNT"
+    mount_check "mount -t ${MAIN_FS_TYPE}  $ROOTDEV $ROOTMNT"
+  fi
   if [ $IMAGE_TYPE = "liveimg" ]; then
-    dbglg "mount -t ext3 $BOOTDEV $INSTALL_DIR/bootfs"
-    mount_check "mount -t ext3 $BOOTDEV $INSTALL_DIR/bootfs"
+    if [ X$PART_SPLIT == "Xdual" ]; then
+      dbglg "mount -t ${BOOT_FS_TYPE} $BOOTDEV $INSTALL_DIR/bootfs"
+      mount_check "mount -t ${BOOT_FS_TYPE} $BOOTDEV $INSTALL_DIR/bootfs"
+    fi
   fi
 # Copy OS
   output "Copy root file system"
@@ -1017,8 +1208,9 @@ copy_fs () {
   dbglg_exec "ln -s /proc/self/fd/2 $ROOTMNT/dev/stderr"
   if [ $IMAGE_TYPE = "liveimg" ]; then
     output "Copy boot file system"
+    ls /boot/
     progress_bar 0 25 0
-    dbglg_exec "rsync -aq /boot/ $INSTALL_DIR/bootfs"
+    dbglg_exec "rsync -aq /boot/ $BOOT_DIR"
     progress_bar 25 25 100
     echo ""
   fi
@@ -1030,12 +1222,16 @@ write_fstab () {
   local FSTAB_FILE
   FSTAB_FILE=${ROOTMNT}/etc/fstab
   output "Write fstab and mtab"
-  echo "# Created by installer-shell" > $FSTAB_FILE
+  echo "# Created by instalateur " > $FSTAB_FILE
   if [ $IMAGE_TYPE = "liveimg" ]; then
-    echo "$BOOTDEV    /boot   ext3    defaults                                    1 2" >> $FSTAB_FILE
+    echo "$BOOTDEV    /boot   ${BOOT_FS_TYPE}    defaults                                    1 2" >> $FSTAB_FILE
   fi
-  echo "$ROOTDEV    /       btrfs   nodatasum,relatime,compress                 1 1" >> $FSTAB_FILE
-  echo "$ROOTDEV    /home   btrfs   nodatasum,relatime,compress,subvolid=$HOMEID    1 2" >> $FSTAB_FILE
+  if [ X${MAIN_FS_TYPE} == "Xbtrfs"]; then
+    echo "$ROOTDEV    /       ${MAIN_FS_TYPE}   nodatasum,relatime,compress                 1 1" >> $FSTAB_FILE
+    echo "$ROOTDEV    /home   ${MAIN_FS_TYPE}   nodatasum,relatime,compress,subvolid=$HOMEID    1 2" >> $FSTAB_FILE
+  else 
+    echo "$ROOTDEV    /       ${MAIN_FS_TYPE}   defaults                 1 1" >> $FSTAB_FILE
+  fi
   echo "$SWAPDEV    swap    swap    defaults                                    0 0" >> $FSTAB_FILE
 
   cat >> $FSTAB_FILE <<EOF
@@ -1190,28 +1386,30 @@ update_extlinux () {
 }
 
 install_syslinux () {
-  local CONF_FILE=$INSTALL_DIR/bootfs/extlinux/extlinux.conf
-  local CONF_DIR=$INSTALL_DIR/bootfs/extlinux
-  local BOOTFS_DIR=$INSTALL_DIR/bootfs
+  local CONF_FILE=$BOOT_DIR/extlinux/extlinux.conf
+  local CONF_DIR=$BOOT_DIR/extlinux
+  local BOOTFS_DIR=$BOOT_DIR
   local KERN LABEL i
-        local BOOT_QUIET="quiet"
-        local BOOT_LEVEL="3"
+  local BOOT_QUIET="quiet"
+  local BOOT_LEVEL="3"
   output "Install bootloader"
   if [ ! -x /sbin/extlinux ]; then
     fail_exit "Syslinux-extlinux package is not installed."
   fi
 # Install extlinux
   output "Install extlinux to /boot/extlinux"
+  output "$INSTALL_DIR/bootfs has "
+  ls $INSTALL_DIR/bootfs
   dbglg_exec "/sbin/extlinux -i $CONF_DIR"
   output "Write MBR to /dev/$DEV"
   dbglg_exec "/bin/dd if=/dev/$DEV of=${CONF_DIR}/mbr.bak count=1 bs=512"
   dbglg_exec "/bin/dd if=${ROOTMNT}/usr/share/syslinux/mbr.bin of=/dev/$DEV"
 # Generate extlinux.conf
-  output "Write extlinux.conf"
-  echo "# extlinux.conf - generated by installer-shell" > $CONF_FILE
-  echo "" >> $CONF_FILE
-  echo "prompt 0" >> $CONF_FILE
-  echo "timeout 80" >> $CONF_FILE
+  output "Write extlinux.conf to " $CONF_FILE
+  echo "# extlinux.conf - generated by instalateur " | tee $CONF_FILE
+  echo "" | tee -a $CONF_FILE
+  echo "prompt 0" | tee -a $CONF_FILE
+  echo "timeout 80" | tee -a $CONF_FILE
   for i in ivi connext automotive; do
     IVI=`find $BOOTFS_DIR -name config-*-$i`
     if [ -z $IVI ]; then
@@ -1222,15 +1420,15 @@ install_syslinux () {
   done
   dbglg "Is this IVI build? $IVI"
   if [ -z $IVI ]; then
-    echo "default vesamenu.c32" >> $CONF_FILE
+    echo "default vesamenu.c32" | tee -a $CONF_FILE
   else
-    echo "default menu.c32" >> $CONF_FILE
+    echo "default menu.c32" | tee -a $CONF_FILE
   fi
   cat >> $CONF_FILE <<EOF
 
-menu autoboot Starting MeeGo...
+menu autoboot Starting $SYSTEM_TYPE...
 menu background splash.jpg
-menu title Welcome to MeeGo!
+menu title Welcome to $SYSTEM_TYPE!
 menu color border      0 #ffffffff #00000000
 menu color sel         7 #ffffffff #ff000000
 menu color title       0 #ffffffff #00000000
@@ -1246,17 +1444,16 @@ EOF
   KERN=`find $BOOTFS_DIR -name vmlinuz-* -printf %f`
   LABEL=${KERN/vmlinuz-/}
   dbglg "Read kern=$KERN label=$LABEL"
-  echo "label meego" >> $CONF_FILE
-  echo "        menu label MeeGo ($LABEL)" >> $CONF_FILE
-  echo "        kernel $KERN" >> $CONF_FILE
-  echo "        append ro root=$ROOTDEV $BOOT_QUIET $BOOT_LEVEL vga=current" >> $CONF_FILE
-  echo "        menu default" >> $CONF_FILE
-# update extlinux menu
-  if [ $WHOLE_DISK -eq 0 -a -n $NEED_OS_PROBE -a $NEED_OS_PROBE -eq 1 ]; then
-    if os_probe; then
-      update_extlinux $CONF_FILE
-    fi
-  fi
+  echo "label ${SYSTEM_LABEL}" | tee -a $CONF_FILE
+  echo "        menu label $SYSTEM_TYPE ($LABEL)" | tee -a $CONF_FILE
+  echo "        kernel $KERN" | tee -a $CONF_FILE
+  echo "        append ro root=$ROOTDEV $BOOT_QUIET $BOOT_LEVEL vga=current" | tee -a $CONF_FILE
+  echo "        menu default" | tee -a $CONF_FILE
+
+  CONF_FILE_LS=$(ls -l $CONF_FILE)
+  output " conf file is here: " $CONF_FILE_LS
+  output " conf file contains "
+  cat $CONF_FILE
   output "Copy background picture"
   dbglg_exec "cp ${ROOTMNT}/usr/lib/anaconda-runtime/syslinux-vesa-splash.jpg ${CONF_DIR}/splash.jpg"
   dbglg_exec "ln -s ../${KERN} ${CONF_DIR}/${KERN}"
@@ -1264,12 +1461,13 @@ EOF
 
 create_factory_snapshot ()
 {
-  # create a quick snapshot of meego_root -> meego_root_factory
+  # create a quick snapshot of ${SYSTEM_LABEL}_root -> ${SYSTEM_LABEL}_root_factory
+  return
   sync
   persistent_umount $ROOTMNT/home
   persistent_umount $ROOTMNT
   dbglg_exec "mount -o subvolid=0 $ROOTDEV $ROOTMNT"
-  dbglg_exec "btrfs subvol snapshot $ROOTMNT/meego_root $ROOTMNT/meego_root_factory"
+  dbglg_exec "${MAIN_FS_TYPE} subvol snapshot $ROOTMNT/${SYSTEM_LABEL}_root $ROOTMNT/${SYSTEM_LABEL}_root_factory"
   persistent_umount $ROOTMNT
 }
 
@@ -1289,9 +1487,10 @@ rebuild_initrd () {
 }
 
 do_postinstall () {
-  local POST_SCRIPT="/etc/installer/post_install.sh"
+  local POST_SCRIPT="/etc/instalateur/post_install.sh"
   output "Run post install scripts"
   if [ ! -f $POST_SCRIPT ]; then
+    output " no post install script"
     dbglg "The post script $POST_SCRIPT doesn't exist, return"
     return
   fi
@@ -1305,10 +1504,10 @@ do_postinstall () {
   persistent_umount $ROOTMNT/proc
 }
 
-VERSION=`head -1 /etc/meego-release`
+VERSION=`head -1 /etc/${SYSTEM_LABEL}-release`
 trap "clean_env" INT TERM
 echo > $LOGFILE
-output "Welcome to MeeGo $VERSION"
+output "Welcome to $SYSTEM_TYPE $VERSION"
 # should not be present in install mode, but in case of ...
 dbglg_exec "killall -9 automountd >/dev/null 2>&1"
 
@@ -1328,10 +1527,11 @@ if [ $USER_ANSWER -eq 0 ]; then
   SILENT_MODE=0
   choose_device
   output ""
-  output "\033[31mWARNING:\033[0m"
+  output "\033[1;33mWARNING:\033[0m"
   output ""
-  output "You are going to install MeeGo. For this /dev/$DEV will be formated"
-  output "which will cause all existing data on this disk to be lost."
+  output "You are going to install $SYSTEM_TYPE."
+  output "For this /dev/$DEV will be formated"
+  output "Some or all existing data on this disk will be lost."
   output ""
 elif [ $USER_ANSWER -eq 1 ]; then
   SILENT_MODE=1
@@ -1354,6 +1554,7 @@ fi
 USE_EXISTING="new"
 choose_old_or_new
 
+PART_SPLIT="dual"
 if [ X$USE_EXISTING == "Xexisting" ]; then
   use_existing_partition
 elif [ X$USE_EXIUSTING == "Xnew" ]; then
@@ -1362,10 +1563,14 @@ else
   fail_exit "Cancelled Installation"
 fi
 
-create_fs
-copy_fs
+output "Create file sytems for " $PART_SPLIT
+create_fs $PART_SPLIT
+output "Copy file sytems for " $PART_SPLIT
+copy_fs $PART_SPLIT
+output "Write fstab"
 write_fstab
 if [ "$IMAGE_TYPE" = "liveimg" ]; then
+  output "Install syslinux..."
   install_syslinux
 else
   rebuild_initrd
@@ -1377,8 +1582,10 @@ dbglg_exec "cp $LOGFILE $ROOTMNT$LOGFILE"
 
 create_factory_snapshot
 
+output "Clean up a little"
 clean_env
 
+output "Run inital fsck"
 run_fsck
 
 # finish and reboot
