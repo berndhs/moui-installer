@@ -1370,6 +1370,7 @@ update_extlinux () {
 }
 
 ask_boot () {
+  # return 1 if use wants to re-write MBR, 0 if not
   local OLD_PS3
   OLD_PS3=$PS3
   PS3="select boot loader option [leave]-> "
@@ -1385,6 +1386,11 @@ ask_boot () {
     fi
   done         
   PS3=$OLD_PS3
+  if [ X$BOOT_REWRITE != "Xleave" ]; then
+    return 1
+  else
+    return 0
+  fi
 }
 
 install_syslinux () {
