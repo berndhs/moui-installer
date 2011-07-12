@@ -4,7 +4,7 @@ Version: 0.1.4
 Release: 1
 Group: Applications/System
 License: GPLv2+
-URL: http://moui.sourceforge.net
+URL: https://github.com/berndhs/moui-installer
 Sources:
     - instalateur-%{version}.tar.gz
 Description: |

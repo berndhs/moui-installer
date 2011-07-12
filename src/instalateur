@@ -1002,9 +1002,6 @@ wait_proceed () {
 create_fs () {
   local PART_ORG
   PART_ORG=$1
-  output "at start of create_fs: "
-  mount
-  wait_proceed
   output "Create " $PART_ORG " filesystems"
 # If device is not null
   pre_partition
@@ -1077,13 +1074,7 @@ create_fs () {
     dbglg_exec "mkdir $ROOTMNT/boot/extlinux"
     dbglg_exec "chmod 0755 $ROOTMNT/boot/extlinux"
   fi
-  output "before persistent_umount " $ROOTMNT
-  mount
-  wait_proceed
   persistent_umount $ROOTMNT
-  output "at end of create_fs: "
-  mount
-  wait_proceed
 }
 
 progress_bar () {
