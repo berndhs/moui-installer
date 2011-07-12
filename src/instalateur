@@ -1526,7 +1526,7 @@ trap "clean_env" INT TERM
 echo > $LOGFILE
 output "Welcome to $SYSTEM_TYPE $VERSION"
 output " "
-putput "Installer version " $INSTALATEUR_VERSION
+output "Installer version " $INSTALATEUR_VERSION
 output " "
 # should not be present in install mode, but in case of ...
 dbglg_exec "killall -9 automountd >/dev/null 2>&1"
