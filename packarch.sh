@@ -1,6 +1,6 @@
 #!/bin/bash
-VERSION=$(cat src/version)
-PREFIX=instalateur-${VERSION}
+eval $(grep INSTALATEUR_VERSION src/instalateur)
+PREFIX=instalateur-${INSTALATEUR_VERSION}
 TARFILE=${PREFIX}.tar.gz
 SRC_FILES=$(git ls-files src/)
 OTHER_FILES="Makefile \
