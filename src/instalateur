@@ -3,7 +3,7 @@
 # Configuration variables
 INSTALL_DIR=/tmp/sysimage
 LOGFILE=/tmp/install.log
-ROOTMNT=$INSTALL_DIR
+ROOTMNT=$INSTALL_DIR/rtmnt
 PART_BACKUP=  #backup partition table for rollback
 PART_PREFIX=
 HOMEID=
@@ -138,37 +138,6 @@ run_fsck () {
   fi
 }
 
-wait_user () {
-  local first_char answer NUM PROMPT TMP_PROMPT
-  NUM=9
-  PROMPT=${1:-" Installation will start. Do you want to continue? "}
-  while true; do
-    while [ "$NUM" -ge 0 ]; do
-      TMP_PROMPT="$PROMPT $NUM (yes/no)[no]"
-      echo -ne "\r$TMP_PROMPT"
-      unset first_char && read -t 1 -n 1 first_char
-      if [ -n "$first_char" ]; then
-        break
-      fi
-      NUM=$(($NUM-1))
-    done
-    if [ -z "$first_char" ]; then
-      USER_ANSWER=0
-      break
-    fi
-    unset answer && read answer
-    answer=`printf "%s%s" "$first_char" "$answer"`
-    if [ "$answer" = "yes" ]; then
-      USER_ANSWER=1
-      break
-    elif [ "$answer" = "no" ]; then
-      USER_ANSWER=0
-      break
-    fi
-  done
-  echo ""
-}
-
 check_and_choose_disk () {
   output "Check all disks and choose one to install"
   local SIZE VENDOR MODEL DISKNAME LIVE_DEV INDEX i
@@ -193,7 +162,7 @@ check_and_choose_disk () {
   if [ ${#DISK_ARRAY[*]} -eq 0 ]; then
     fail_exit "No disk large enough, at leat ${SMALLEST_SPACE}MB, to install $SYSTEM_TYPE."
   fi
-  dbglg "Find disks: ${DISK_ARRAY[@]}, NOTE: Disks doesn't be listed here if its capacity size is smaller than ${SMALLEST_SPACE}MB"
+  dbglg "Find disks: ${DISK_ARRAY[@]}, NOTE: Disks won't be listed here if its capacity is smaller than ${SMALLEST_SPACE}MB"
   dbglg "Got disk_list: ${DISK_MENU[@]}"
 }
 
@@ -376,7 +345,7 @@ use_existing_single_partition () {
   FOUND=0
   PART_SIZE=0
   for PART_LINE in $(
-                   sudo sfdisk -l -uM /dev/sda | 
+                   sfdisk -l -uM /dev/sda | 
                    grep '^/dev/' | 
                    sed 's/\*/\ /' | 
                    awk '{printf "%s,%d,%d,%s ", $1,$2,$3,$6}'
@@ -1016,9 +985,24 @@ create_partitions () {
   fi
 }
 
+wait_proceed () {
+  local Q_FOR_QUIT
+  echo -n "Proceed or Q for quit [proceed] ? "
+  read Q_FOR_QUIT
+  if [ X$Q_FOR_QUIT == "XQ" ]; then
+    fail_exit "User Quit"
+  fi
+  if [ X$Q_FOR_QUIT == "Xq" ]; then
+    fail_exit "User quit"
+  fi
+}
+
 create_fs () {
   local PART_ORG
   PART_ORG=$1
+  output "at start of create_fs: "
+  mount
+  wait_proceed
   output "Create " $PART_ORG " filesystems"
 # If device is not null
   pre_partition
@@ -1074,11 +1058,8 @@ create_fs () {
     ROOTID=$(${MAIN_FS_TYPE} subvol list $ROOTMNT | awk ' ($7 == "${SYSTEM_LABEL}_root") { print $2 }')
     HOMEID=$(${MAIN_FS_TYPE} subvol list $ROOTMNT | awk ' ($7 == "${SYSTEM_LABEL}_home") { print $2 }')
     dbglg_exec "${MAIN_FS_TYPE} subvol set-default $ROOTID $ROOTMNT"
-  else
-    dbglg_exec "mount $ROOTDEV $ROOTMNT"
-    
+    persistent_umount $ROOTMNT
   fi
-  persistent_umount $ROOTMNT
 # Create /home with proper permissions inside ${SYSTEM_LABEL}_root
   mkdir -p $ROOTMNT
   dbglg_exec "mount $ROOTDEV $ROOTMNT"
@@ -1094,7 +1075,13 @@ create_fs () {
     dbglg_exec "mkdir $ROOTMNT/boot/extlinux"
     dbglg_exec "chmod 0755 $ROOTMNT/boot/extlinux"
   fi
+  output "before persistent_umount " $ROOTMNT
+  mount
+  wait_proceed
   persistent_umount $ROOTMNT
+  output "at end of create_fs: "
+  mount
+  wait_proceed
 }
 
 progress_bar () {
@@ -1149,8 +1136,10 @@ check_status () {
 }
 
 mount_check () {
+  output "mount check: " $@
   eval "$@" >> $LOGFILE 2>&1
   if [ $? -ne 0 ]; then
+    output "mount table:"
     fail_exit "Failed to mount."
   fi
 }
@@ -1169,6 +1158,8 @@ copy_fs () {
     dbglg "mount -t ${MAIN_FS_TYPE} -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
     mount_check "mount -t ${MAIN_FS_TYPE} -o relatime,compress,subvolid=$HOMEID $ROOTDEV $ROOTMNT/home"
   else
+    output "Using fstype " ${MAIN_FS_TYPE}
+    output "try mount -t ${MAIN_FS_TYPE} $ROOTDEV $ROOTMNT"
     dbglg "mount -t ${MAIN_FS_TYPE} $ROOTDEV $ROOTMNT"
     mount_check "mount -t ${MAIN_FS_TYPE}  $ROOTDEV $ROOTMNT"
   fi
@@ -1385,6 +1376,24 @@ update_extlinux () {
   unset tmp_ker_array tmp_initrd_array
 }
 
+ask_boot () {
+  local OLD_PS3
+  OLD_PS3=$PS3
+  PS3="select boot loader option [leave]-> "
+  select ans in "Install new Boot Loader" \
+                "Leave old Boot Loader" 
+  do
+    if [ $REPLY -eq 1 ]; then
+      BOOT_REWRITE="new"
+      break
+    elif [ $REPLY -eq 2 ]; then
+      BOOT_REWRITE="leave"
+      break
+    fi
+  done         
+  PS3=$OLD_PS3
+}
+
 install_syslinux () {
   local CONF_FILE=$BOOT_DIR/extlinux/extlinux.conf
   local CONF_DIR=$BOOT_DIR/extlinux
@@ -1392,20 +1401,26 @@ install_syslinux () {
   local KERN LABEL i
   local BOOT_QUIET="quiet"
   local BOOT_LEVEL="3"
-  output "Install bootloader"
-  if [ ! -x /sbin/extlinux ]; then
-    fail_exit "Syslinux-extlinux package is not installed."
-  fi
+
+  output "Install Boot Information"
+  
+  BOOT_REWRITE="leave"
+  ask_boot
+  if [ ! X$BOOT_REWRITE == "Xleave" ] ; then
+    if [ ! -x /sbin/extlinux ]; then
+      fail_exit "Syslinux-extlinux package is not installed."
+    fi
 # Install extlinux
-  output "Install extlinux to /boot/extlinux"
-  output "$INSTALL_DIR/bootfs has "
-  ls $INSTALL_DIR/bootfs
-  dbglg_exec "/sbin/extlinux -i $CONF_DIR"
-  output "Write MBR to /dev/$DEV"
-  dbglg_exec "/bin/dd if=/dev/$DEV of=${CONF_DIR}/mbr.bak count=1 bs=512"
-  dbglg_exec "/bin/dd if=${ROOTMNT}/usr/share/syslinux/mbr.bin of=/dev/$DEV"
+    output "Install extlinux to /boot/extlinux"
+    output "$INSTALL_DIR/bootfs has "
+    ls $INSTALL_DIR/bootfs
+    dbglg_exec "/sbin/extlinux -i $CONF_DIR"
+    output "Write MBR to /dev/$DEV"
+    dbglg_exec "/bin/dd if=/dev/$DEV of=${CONF_DIR}/mbr.bak count=1 bs=512"
+    dbglg_exec "/bin/dd if=${ROOTMNT}/usr/share/syslinux/mbr.bin of=/dev/$DEV"
+  fi
 # Generate extlinux.conf
-  output "Write extlinux.conf to " $CONF_FILE
+  output "Install extlinux.conf"
   echo "# extlinux.conf - generated by instalateur " | tee $CONF_FILE
   echo "" | tee -a $CONF_FILE
   echo "prompt 0" | tee -a $CONF_FILE
@@ -1522,7 +1537,8 @@ mkdir -p $OS_PROBE_ROOT_MOUNT
 mkdir -p $OS_PROBE_BOOT_MOUNT
 
 check_and_choose_disk
-wait_user " !! Destroy all data on $(echo ${DISK_MENU[0]} |tr -s ' ' ' ') and install? "
+USER_ANSWER=0
+#wait_user " !! Destroy all data on $(echo ${DISK_MENU[0]} |tr -s ' ' ' ') and install? "
 if [ $USER_ANSWER -eq 0 ]; then
   SILENT_MODE=0
   choose_device

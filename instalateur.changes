@@ -1,3 +1,6 @@
+* Tue Jul 12 2011 Bernd Stramm <bernd.stramm@gmail.com> - 0.1.4-1
+- optional writing of MBR
+
 * Mon Jul 11 2011 Bernd Stramm <bernd.stramm@gmail.com> - 0.1.3-1
 - installs something bootable on a single ext3 partition
 
