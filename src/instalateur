@@ -15,7 +15,7 @@ SYSTEM_LABEL="meego"
 MAIN_FS_TYPE="ext3"
 BOOT_FS_TYPE="ext3"
 
-INSTALATEUR_VERSION="0.1.4.2"
+INSTALATEUR_VERSION="0.1.4.3"
 
 VERSION=""
 IMAGE_TYPE=""
@@ -1203,6 +1203,9 @@ copy_fs () {
     dbglg_exec "rsync -aq /boot/ $BOOT_DIR"
     progress_bar 25 25 100
     echo ""
+  fi
+  if [ X$PART_SPLIT == "Xsingle" ]; then
+    dbglg_exec "mkdir -m 0755 $ROOTMNT/home"
   fi
   output "Syncing filesystem, please wait..."
   dbglg_exec "sync"
