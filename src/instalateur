@@ -1199,7 +1199,6 @@ copy_fs () {
   dbglg_exec "ln -s /proc/self/fd/2 $ROOTMNT/dev/stderr"
   if [ $IMAGE_TYPE = "liveimg" ]; then
     output "Copy boot file system to " $BOOT_DIR
-    wait_proceed
     progress_bar 0 25 0
     dbglg_exec "rsync -aq /boot/ $BOOT_DIR"
     progress_bar 25 25 100
