@@ -15,7 +15,7 @@ SYSTEM_LABEL="meego"
 MAIN_FS_TYPE="ext3"
 BOOT_FS_TYPE="ext3"
 
-INSTALATEUR_VERSION="0.1.4"
+INSTALATEUR_VERSION="0.1.4.2"
 
 VERSION=""
 IMAGE_TYPE=""
@@ -472,7 +472,10 @@ use_existing_dual_partition () {
   ROW=1
   HOLE_SIZE=0
   FOUND=0
-  for i in $(sfdisk -l -uM /dev/$DEV |grep "^/dev/" |grep -v "Extended" |grep -v "Empty" |
+  for i in $(sfdisk -l -uM /dev/$DEV |
+               grep "^/dev/" |
+               grep -v "Extended" |
+               grep -v "Empty" |
     awk '{if(NF<=8){printf "%d,%d\n", $((NF-5)),$((NF-4))}else{printf "%d,%d\n", $((NF-8)),$((NF-7))}}' |sort -n); do
     tmp_s=$(echo $i |cut -d',' -f1)
     tmp_e=$(echo $i |cut -d',' -f2)
@@ -522,7 +525,11 @@ EOF
   post_partition
   output " partitioning stage 2"
 # If there is a swap partition, just use it
-  tmp_swap_nr=$(sfdisk -l /dev/$DEV |grep "^/dev/.*Linux swap / Solaris$" |awk '{print $1}' |grep -o "[1-9]\|[1-9][0-9]" |head -1)
+  tmp_swap_nr=$(sfdisk -l /dev/$DEV |
+               grep "^/dev/.*Linux swap / Solaris$" |
+               awk '{print $1}' |
+               grep -o "[1-9]\|[1-9][0-9]" |
+               head -1)
   ROOT_SIZE=$(($HOLE_MAX-$BOOT_SIZE-$SWAP_SIZE))
   pre_partition
   if [ $IMAGE_TYPE = "liveimg" ]; then
@@ -1018,7 +1025,7 @@ create_fs () {
         fail_exit "No boot device."
       fi
     else
-      BOOT_DIR=$INSTALL_DIR/boot
+      BOOT_DIR=$ROOTMNT/boot
     fi
   fi
   output " See if we create root device " $ROOTDEV
@@ -1191,8 +1198,8 @@ copy_fs () {
   dbglg_exec "ln -s /proc/self/fd/1 $ROOTMNT/dev/stdout"
   dbglg_exec "ln -s /proc/self/fd/2 $ROOTMNT/dev/stderr"
   if [ $IMAGE_TYPE = "liveimg" ]; then
-    output "Copy boot file system"
-    ls /boot/
+    output "Copy boot file system to " $BOOT_DIR
+    wait_proceed
     progress_bar 0 25 0
     dbglg_exec "rsync -aq /boot/ $BOOT_DIR"
     progress_bar 25 25 100
@@ -1210,7 +1217,7 @@ write_fstab () {
   if [ $IMAGE_TYPE = "liveimg" ]; then
     echo "$BOOTDEV    /boot   ${BOOT_FS_TYPE}    defaults                                    1 2" >> $FSTAB_FILE
   fi
-  if [ X${MAIN_FS_TYPE} == "Xbtrfs"]; then
+  if [ X${MAIN_FS_TYPE} == "Xbtrfs" ]; then
     echo "$ROOTDEV    /       ${MAIN_FS_TYPE}   nodatasum,relatime,compress                 1 1" >> $FSTAB_FILE
     echo "$ROOTDEV    /home   ${MAIN_FS_TYPE}   nodatasum,relatime,compress,subvolid=$HOMEID    1 2" >> $FSTAB_FILE
   else 
