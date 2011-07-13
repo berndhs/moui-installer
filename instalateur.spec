@@ -7,11 +7,11 @@
 
 Name:       instalateur
 Summary:    A shell-script based installer
-Version:    0.1.4
+Version:    0.1.4.2
 Release:    1
 Group:      Applications/System
 License:    GPLv2+
-URL:        http://moui.sourceforge.net
+URL:        https://github.com/berndhs/moui-installer
 Source0:    instalateur-%{version}.tar.gz
 Source100:  instalateur.yaml
 Requires:   parted
