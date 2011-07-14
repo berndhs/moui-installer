@@ -1,3 +1,6 @@
+* Wed Jul 13 2011 Bernd Stramm <bernd.stramm@gmail.com> - 0.1.4.4-1
+- don't remove /home
+
 * Tue Jul 12 2011 Bernd Stramm <bernd.stramm@gmail.com> - 0.1.4.3-1
 - bug fixes
 

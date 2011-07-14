@@ -11,11 +11,12 @@ ROOTID=
 
 SYSTEM_TYPE="MeeGo"
 SYSTEM_LABEL="meego"
+LIVE_USER="meego"
 
 MAIN_FS_TYPE="ext3"
 BOOT_FS_TYPE="ext3"
 
-INSTALATEUR_VERSION="0.1.4.3"
+INSTALATEUR_VERSION="0.1.4.4"
 
 VERSION=""
 IMAGE_TYPE=""
@@ -124,7 +125,6 @@ clean_env () {
   umount_and_rm $OS_PROBE_ROOT_MOUNT
   umount_and_rm $OS_PROBE_BOOT_MOUNT
   umount_and_rm $INSTALL_DIR/bootfs
-  umount_and_rm $ROOTMNT/home
   umount_and_rm $ROOTMNT
   dbglg_exec "rm -rf $INSTALL_DIR"
 }
@@ -1174,7 +1174,7 @@ copy_fs () {
   TOTAL_SIZE=`df /| grep /| tr -s ' ' ' ' | cut -d' ' -f3`
   dbglg "Read root fs size = $TOTAL_SIZE"
   if [ $IMAGE_TYPE = "liveimg" ]; then
-    dbglg_exec "rsync -aq --exclude=/boot/* --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/media/* --exclude=/tmp/* / $ROOTMNT &"
+    dbglg_exec "rsync -aq --exclude=/home/${LIVE_USER} --exclude=/boot/* --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/media/* --exclude=/tmp/* / $ROOTMNT &"
   elif [ $IMAGE_TYPE = "nandfs" ]; then
     dbglg_exec "rsync -aq --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/media/* --exclude=/tmp/* / $ROOTMNT &"
   fi
