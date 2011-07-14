@@ -8,7 +8,7 @@ URL: https://github.com/berndhs/moui-installer
 Sources:
     - instalateur-%{version}.tar.gz
 Description: |
-    A shell-script based installer which implements the installation process in silent mode
+    A shell-script based installer which implements the installation process.
 Requires:
     - parted
     - dialog
