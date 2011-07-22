@@ -1408,7 +1408,7 @@ install_syslinux () {
   local BOOTFS_DIR=$BOOT_DIR
   local KERN LABEL i
   local BOOT_QUIET="quiet"
-  local BOOT_LEVEL="3"
+  local BOOT_LEVEL=""
 
   output "Install Boot Information"
   
