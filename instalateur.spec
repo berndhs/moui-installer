@@ -7,7 +7,7 @@
 
 Name:       instalateur
 Summary:    A shell-script based installer
-Version:    0.1.4.4
+Version:    0.1.4.6
 Release:    1
 Group:      Applications/System
 License:    GPLv2+
@@ -20,12 +20,12 @@ Requires:   rsync
 Requires:   system-logos
 Requires:   e2fsprogs
 Requires:   btrfs-progs
-Requires:   util-linux-ng
+Requires:   util-linux
 Requires:   syslinux-extlinux
 
 
 %description
-A shell-script based installer which implements the installation process in silent mode
+A shell-script based installer for developers
 
 
 

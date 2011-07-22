@@ -16,7 +16,7 @@ LIVE_USER="meego"
 MAIN_FS_TYPE="ext3"
 BOOT_FS_TYPE="ext3"
 
-INSTALATEUR_VERSION="0.1.4.5"
+INSTALATEUR_VERSION="0.1.4.7"
 
 VERSION=""
 IMAGE_TYPE=""
@@ -1511,6 +1511,43 @@ rebuild_initrd () {
 	END
 }
 
+ask_useradd () {
+  local OLD_PS3 ADDUSER
+  OLD_PS3=$PS3
+  PS3="add user for installed system? [yes]-> "
+  ADDUSER=1
+  TRIAL_COUNT=0
+  select ANS in "Add User Account" \
+                "Do Not Add User Account" 
+  do
+    if [ $REPLY -eq 1 ]; then
+      ADDUSER=0
+      break
+    elif [ $REPLY -eq 2 ]; then
+      ADDUSER=1
+      break
+    fi
+    TRIALCOUNT=$((TRIALCOUNT+1))
+    if [ $TRIALCOUNT -ge 3 ]; then
+      break
+    fi
+  done         
+  PS3=$OLD_PS3
+  return $ADDUSER
+}
+
+do_useradd () {
+  local NEW_USER
+  NEW_USER="none"
+  read -p "User Name: " NEW_USER
+  NOSPACE_USER=$(echo $NEW_USER | awk '{print $1}')
+  if [ ! X$NOSPACE_USER == "X" ]; then
+    useradd $NOSPACE_USER --password ""
+    echo "user=$NOSPACE_USER" >> /etc/sysconfig/uxlaunch
+    echo "AUTOLOGIN_USER" >> /etc/sysconfig/desktop
+  fi
+}
+
 do_postinstall () {
   local POST_SCRIPT="/etc/instalateur/post_install.sh"
   output "Run post install scripts"
@@ -1524,6 +1561,9 @@ do_postinstall () {
   dbglg_exec "mount -t devpts devpts $ROOTMNT/dev/pts"
   dbglg_exec "mount -t sysfs sysfs $ROOTMNT/sys"
   dbglg_exec "chroot $ROOTMNT $POST_SCRIPT"
+  if ask_useradd ; then
+    do_useradd
+  fi
   persistent_umount $ROOTMNT/sys
   persistent_umount $ROOTMNT/dev/pts
   persistent_umount $ROOTMNT/proc

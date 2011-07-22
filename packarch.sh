@@ -12,6 +12,7 @@ OTHER_FILES="Makefile \
 	"
 TRANSFORM='s,^,'${PREFIX}/','
 tar --transform ${TRANSFORM} -zcvf ${TARFILE} ${SRC_FILES} ${OTHER_FILES}
+echo ${VERSION} > VERSION
 echo
 echo "created " ${TARFILE}
 echo
