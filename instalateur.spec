@@ -7,7 +7,7 @@
 
 Name:       instalateur
 Summary:    A shell-script based installer
-Version:    0.1.4.6
+Version:    0.1.4.7
 Release:    1
 Group:      Applications/System
 License:    GPLv2+

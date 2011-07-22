@@ -1537,14 +1537,24 @@ ask_useradd () {
 }
 
 do_useradd () {
-  local NEW_USER
+  local NEW_USER TMPEXEC
   NEW_USER="none"
+  echo ""
   read -p "User Name: " NEW_USER
   NOSPACE_USER=$(echo $NEW_USER | awk '{print $1}')
+  TMPSCRIPT=/tmp/do_useradd
+  TMPEXEC=${ROOTMNT}${TMPSCRIPT}
   if [ ! X$NOSPACE_USER == "X" ]; then
-    useradd $NOSPACE_USER --password ""
-    echo "user=$NOSPACE_USER" >> /etc/sysconfig/uxlaunch
-    echo "AUTOLOGIN_USER" >> /etc/sysconfig/desktop
+    echo '#/!bin/bash' > $TMPEXEC
+    echo "NOSPACE_USER="$NOSPACE_USER >> $TMPEXEC
+    echo 'useradd $NOSPACE_USER --password ""' \
+          >> $TMPEXEC
+    echo 'echo "user=$NOSPACE_USER" >> /etc/sysconfig/uxlaunch' \
+          >> $TMPEXEC
+    echo 'echo "AUTOLOGIN_USER=$NOSPACE_USER" >> /etc/sysconfig/desktop' \
+          >> $TMPEXEC
+    chmod u+x $TMPEXEC
+    dbglg_exec "chroot $ROOTMNT $TMPSCRIPT"
   fi
 }
 
